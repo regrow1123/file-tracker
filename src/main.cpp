@@ -124,7 +124,14 @@ int main(int argc, char **argv) {
 
     // Debouncer callback
     auto send_event = [&](const std::string& path, uint32_t event_type) {
-        const char *type_str = (event_type == EVENT_DELETE) ? "delete" : "mtime_change";
+        const char *type_str;
+        switch (event_type) {
+            case EVENT_DELETE:      type_str = "delete"; break;
+            case EVENT_MTIME:       type_str = "mtime_change"; break;
+            case EVENT_RENAME_FROM: type_str = "rename_from"; break;
+            case EVENT_RENAME_TO:   type_str = "rename_to"; break;
+            default:                type_str = "unknown"; break;
+        }
         auto ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
 

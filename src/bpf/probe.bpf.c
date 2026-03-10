@@ -6,8 +6,10 @@
 
 #define MAX_DEPTH    20
 #define MAX_NAME_LEN 256
-#define EVENT_DELETE  0
-#define EVENT_MTIME   1
+#define EVENT_DELETE      0
+#define EVENT_MTIME       1
+#define EVENT_RENAME_FROM 2
+#define EVENT_RENAME_TO   3
 
 struct file_event {
     __u64 ts_ns;
@@ -99,6 +101,19 @@ int BPF_KPROBE(trace_do_truncate, void *idmap_or_userns,
                struct dentry *dentry)
 {
     return emit_event(dentry, EVENT_MTIME);
+}
+
+SEC("kprobe/vfs_rename")
+int BPF_KPROBE(trace_vfs_rename, struct renamedata *rd)
+{
+    struct dentry *old_dentry = BPF_CORE_READ(rd, old_dentry);
+    struct dentry *new_dentry = BPF_CORE_READ(rd, new_dentry);
+
+    // Emit old path (rename_from) and new path (rename_to)
+    // Both share the same timestamp for consumer correlation
+    emit_event(old_dentry, EVENT_RENAME_FROM);
+    emit_event(new_dentry, EVENT_RENAME_TO);
+    return 0;
 }
 
 SEC("kprobe/vfs_utimes")

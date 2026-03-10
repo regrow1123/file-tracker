@@ -4,8 +4,10 @@
 
 #define MAX_DEPTH    20
 #define MAX_NAME_LEN 256
-#define EVENT_DELETE  0
-#define EVENT_MTIME   1
+#define EVENT_DELETE      0
+#define EVENT_MTIME       1
+#define EVENT_RENAME_FROM 2
+#define EVENT_RENAME_TO   3
 
 struct file_event {
     uint64_t ts_ns;
