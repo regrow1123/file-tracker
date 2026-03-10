@@ -64,6 +64,22 @@ void Debouncer::tick() {
     }
 }
 
+void Debouncer::flush_all() {
+    std::vector<std::pair<std::string, uint32_t>> to_fire;
+
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        for (auto& [path, entry] : entries_) {
+            to_fire.emplace_back(path, EVENT_MTIME);
+        }
+        entries_.clear();
+    }
+
+    for (auto& [path, evt] : to_fire) {
+        cb_(path, evt);
+    }
+}
+
 size_t Debouncer::pending() const {
     std::lock_guard<std::mutex> lock(mu_);
     return entries_.size();

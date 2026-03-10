@@ -7,7 +7,11 @@ quiet_ms    = 10000    # 10초 quiet period
 max_wait_ms = 3600000  # 1시간 max wait
 
 [wal]
-path = "/var/lib/file-tracker/wal/events.wal"
+path        = "/var/lib/file-tracker/wal/events.wal"
+max_size_mb = 1024     # WAL 최대 크기 (MB)
 
 [watch]
 prefix = "/home"
+
+[logging]
+level = "info"         # error, warn, info, debug

@@ -28,6 +28,14 @@ struct {
     __type(value, struct file_event);
 } scratch SEC(".maps");
 
+// Drop counter: index 0 = ringbuf drops, index 1 = total events
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 2);
+    __type(key, __u32);
+    __type(value, __u64);
+} counters SEC(".maps");
+
 static __always_inline int emit_event(struct dentry *dentry, __u32 event_type)
 {
     __u32 zero = 0;
@@ -57,8 +65,18 @@ static __always_inline int emit_event(struct dentry *dentry, __u32 event_type)
 
     if (evt->depth == 0) return 0;
 
+    // Count total events
+    __u32 idx_total = 1;
+    __u64 *total = bpf_map_lookup_elem(&counters, &idx_total);
+    if (total) __sync_fetch_and_add(total, 1);
+
     // /home filtering is done in userspace
-    bpf_ringbuf_output(&events, evt, sizeof(*evt), 0);
+    long err = bpf_ringbuf_output(&events, evt, sizeof(*evt), 0);
+    if (err < 0) {
+        __u32 idx_drop = 0;
+        __u64 *drops = bpf_map_lookup_elem(&counters, &idx_drop);
+        if (drops) __sync_fetch_and_add(drops, 1);
+    }
     return 0;
 }
 

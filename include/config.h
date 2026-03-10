@@ -13,9 +13,13 @@ struct Config {
 
     // WAL
     std::string wal_path = "/var/lib/file-tracker/wal/events.wal";
+    uint64_t wal_max_size_mb = 1024;  // 1GB default
 
     // Watch
     std::string watch_prefix = "/home";
+
+    // Logging
+    std::string log_level = "info";
 
     // Load from TOML file. Returns true on success.
     bool load(const std::string& path);

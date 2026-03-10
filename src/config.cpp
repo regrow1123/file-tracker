@@ -27,12 +27,20 @@ bool Config::load(const std::string& path) {
         if (auto w = tbl["wal"].as_table()) {
             if (auto v = w->get("path"))
                 wal_path = v->value_or(wal_path);
+            if (auto v = w->get("max_size_mb"))
+                wal_max_size_mb = v->value_or(wal_max_size_mb);
         }
 
         // [watch]
         if (auto w = tbl["watch"].as_table()) {
             if (auto v = w->get("prefix"))
                 watch_prefix = v->value_or(watch_prefix);
+        }
+
+        // [logging]
+        if (auto l = tbl["logging"].as_table()) {
+            if (auto v = l->get("level"))
+                log_level = v->value_or(log_level);
         }
 
         fprintf(stderr, "Config loaded from %s\n", path.c_str());
