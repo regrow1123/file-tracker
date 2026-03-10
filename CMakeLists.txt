@@ -45,6 +45,7 @@ add_executable(file-tracker
     src/main.cpp
     src/debouncer.cpp
     src/kafka_producer.cpp
+    src/wal.cpp
 )
 
 target_include_directories(file-tracker PRIVATE

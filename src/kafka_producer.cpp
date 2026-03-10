@@ -23,6 +23,10 @@ KafkaProducer::KafkaProducer(const std::string& brokers, const std::string& topi
     rd_kafka_conf_set(conf, "batch.num.messages", "1000", errstr, sizeof(errstr));
     rd_kafka_conf_set(conf, "linger.ms", "100", errstr, sizeof(errstr));
 
+    // Shorter timeout for faster failure detection when broker is down
+    rd_kafka_conf_set(conf, "message.timeout.ms", "10000", errstr, sizeof(errstr));
+    rd_kafka_conf_set(conf, "socket.timeout.ms", "5000", errstr, sizeof(errstr));
+
     // Delivery report callback
     rd_kafka_conf_set_dr_msg_cb(conf, dr_msg_cb);
     rd_kafka_conf_set_opaque(conf, this);
@@ -48,7 +52,8 @@ KafkaProducer::KafkaProducer(const std::string& brokers, const std::string& topi
 
 KafkaProducer::~KafkaProducer() {
     if (rk_) {
-        rd_kafka_flush(rk_, 5000);
+        // Longer flush to allow delivery callbacks to fire
+        rd_kafka_flush(rk_, 15000);
         if (rkt_) rd_kafka_topic_destroy(rkt_);
         rd_kafka_destroy(rk_);
     }
