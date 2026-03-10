@@ -1,0 +1,6 @@
+build/
+include/vmlinux.h
+*.o
+*.skel.h
+compile_commands.json
+.cache/
