@@ -1,0 +1,45 @@
+Vagrant.configure("2") do |config|
+  config.vm.box = "generic/centos9s"
+  config.vm.hostname = "centos9-test"
+
+  config.vm.provider :libvirt do |v|
+    v.memory = 2048
+    v.cpus = 2
+    v.driver = "kvm"
+  end
+
+  # Sync project directory
+  config.vm.synced_folder "../../", "/home/vagrant/file-tracker", type: "rsync",
+    rsync__exclude: [".git/", "build/", "docs/", "memory/"]
+
+  # Provision: install build deps
+  config.vm.provision "shell", inline: <<-SHELL
+    dnf install -y epel-release
+    dnf install -y clang llvm elfutils-libelf-devel zlib-devel \
+                   cmake gcc-c++ bpftrace kernel-devel kernel-headers \
+                   bpftool git
+
+    # librdkafka from source (not in CentOS Stream 9 repos)
+    if ! pkg-config --exists rdkafka 2>/dev/null; then
+      dnf install -y openssl-devel cyrus-sasl-devel zstd-devel
+      cd /tmp
+      curl -sL https://github.com/confluentinc/librdkafka/archive/refs/tags/v2.3.0.tar.gz | tar xz
+      cd librdkafka-2.3.0
+      ./configure --prefix=/usr
+      make -j$(nproc)
+      make install
+      ldconfig
+    fi
+
+    echo "=== Kernel ==="
+    uname -r
+    echo "=== BTF ==="
+    ls -la /sys/kernel/btf/vmlinux 2>/dev/null || echo "NO BTF"
+    echo "=== bpftool ==="
+    which bpftool && bpftool version || echo "NO bpftool"
+    echo "=== clang ==="
+    clang --version | head -1
+    echo "=== rdkafka ==="
+    pkg-config --modversion rdkafka 2>/dev/null || echo "NO rdkafka"
+  SHELL
+end

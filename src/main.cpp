@@ -84,7 +84,12 @@ int main(int argc, char **argv) {
     uint64_t wal_replayed = 0;
 
     // Create WAL directory
-    system("mkdir -p /var/lib/file-tracker/wal");
+    {
+        std::string cmd = "mkdir -p " + wal_path.substr(0, wal_path.rfind('/'));
+        if (::system(cmd.c_str()) != 0) {
+            fprintf(stderr, "Warning: could not create WAL directory\n");
+        }
+    }
 
     // WAL for Kafka failure buffering
     WAL wal(wal_path);
@@ -159,13 +164,15 @@ int main(int argc, char **argv) {
         auto records = wal.read_all();
         if (!records.empty()) {
             fprintf(stderr, "WAL: replaying %zu records from previous run\n", records.size());
+            // Truncate WAL first to avoid re-appending on delivery failure
+            wal.truncate();
             for (auto& json : records) {
                 kafka.send(json, hostname);
                 wal_replayed++;
             }
             kafka.flush(10000);
-            wal.truncate();
-            fprintf(stderr, "WAL: replay complete, %llu records sent\n",
+            // Any failures during replay will be re-written to WAL by the on_fail callback
+            fprintf(stderr, "WAL: replay complete, %llu records attempted\n",
                     (unsigned long long)wal_replayed);
         }
     }

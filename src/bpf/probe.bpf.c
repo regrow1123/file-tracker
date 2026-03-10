@@ -63,7 +63,7 @@ static __always_inline int emit_event(struct dentry *dentry, __u32 event_type)
 }
 
 SEC("kprobe/vfs_unlink")
-int BPF_KPROBE(trace_vfs_unlink, struct mnt_idmap *idmap,
+int BPF_KPROBE(trace_vfs_unlink, void *idmap_or_userns,
                struct inode *dir, struct dentry *dentry)
 {
     return emit_event(dentry, EVENT_DELETE);
@@ -77,7 +77,7 @@ int BPF_KPROBE(trace_vfs_write, struct file *file)
 }
 
 SEC("kprobe/do_truncate")
-int BPF_KPROBE(trace_do_truncate, struct mnt_idmap *idmap,
+int BPF_KPROBE(trace_do_truncate, void *idmap_or_userns,
                struct dentry *dentry)
 {
     return emit_event(dentry, EVENT_MTIME);

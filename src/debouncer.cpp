@@ -17,23 +17,28 @@ void Debouncer::on_event(const std::string& path, uint32_t event_type) {
     }
 
     // mtime_change → debounce
-    std::lock_guard<std::mutex> lock(mu_);
-    auto now = Clock::now();
-    auto it = entries_.find(path);
-    if (it != entries_.end()) {
-        // Check max_wait
-        if (now - it->second.first_seen >= max_wait_) {
-            entries_.erase(it);
-            // Unlock before callback to avoid holding lock during I/O
-            mu_.unlock();
-            cb_(path, event_type);
-            mu_.lock();
-            // Reset with new first_seen
+    bool fire_max_wait = false;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto now = Clock::now();
+        auto it = entries_.find(path);
+        if (it != entries_.end()) {
+            if (now - it->second.first_seen >= max_wait_) {
+                entries_.erase(it);
+                fire_max_wait = true;
+            } else {
+                it->second.last_seen = now;
+            }
+        } else {
             entries_[path] = {now, now};
-            return;
         }
-        it->second.last_seen = now;
-    } else {
+    }
+
+    if (fire_max_wait) {
+        cb_(path, event_type);
+        // Re-insert with fresh first_seen
+        std::lock_guard<std::mutex> lock(mu_);
+        auto now = Clock::now();
         entries_[path] = {now, now};
     }
 }
