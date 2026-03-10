@@ -1,0 +1,13 @@
+[kafka]
+brokers = "localhost:9092"
+topic   = "file-tracker-events"
+
+[debounce]
+quiet_ms    = 10000    # 10초 quiet period
+max_wait_ms = 3600000  # 1시간 max wait
+
+[wal]
+path = "/var/lib/file-tracker/wal/events.wal"
+
+[watch]
+prefix = "/home"

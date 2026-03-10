@@ -11,6 +11,7 @@
 
 #include "probe.skel.h"
 #include "common.h"
+#include "config.h"
 #include "debouncer.h"
 #include "kafka_producer.h"
 #include "wal.h"
@@ -55,13 +56,14 @@ static std::string to_json(uint64_t ts_ns, const std::string& event_type,
 
 // Globals for ring buffer callback
 static Debouncer *g_debouncer = nullptr;
+static std::string g_watch_prefix;
 
 static int handle_event(void *ctx, void *data, size_t data_sz) {
     auto *evt = static_cast<struct file_event *>(data);
     std::string path = build_path(evt);
 
-    // Userspace /home filter
-    if (path.compare(0, 5, "/home") != 0) return 0;
+    // Userspace prefix filter
+    if (path.compare(0, g_watch_prefix.size(), g_watch_prefix) != 0) return 0;
 
     g_debouncer->on_event(path, evt->event_type);
     return 0;
@@ -71,13 +73,14 @@ int main(int argc, char **argv) {
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
-    // Config (hardcoded for now, will be config.toml later)
-    std::string kafka_brokers = "localhost:9092";
-    std::string kafka_topic = "file-tracker-events";
-    auto debounce_quiet = std::chrono::milliseconds(10000);  // 10s
-    auto debounce_max_wait = std::chrono::milliseconds(3600000);  // 1h
+    // Config
+    Config cfg;
+    std::string config_path = "/etc/file-tracker/config.toml";
+    if (argc > 1) config_path = argv[1];
+    cfg.load(config_path);  // Falls back to defaults if file missing
 
-    std::string wal_path = "/var/lib/file-tracker/wal/events.wal";
+    auto debounce_quiet = std::chrono::milliseconds(cfg.debounce_quiet_ms);
+    auto debounce_max_wait = std::chrono::milliseconds(cfg.debounce_max_wait_ms);
     std::string hostname = get_hostname();
     uint64_t kafka_sent = 0;
     uint64_t kafka_failed = 0;
@@ -85,17 +88,17 @@ int main(int argc, char **argv) {
 
     // Create WAL directory
     {
-        std::string cmd = "mkdir -p " + wal_path.substr(0, wal_path.rfind('/'));
+        std::string cmd = "mkdir -p " + cfg.wal_path.substr(0, cfg.wal_path.rfind('/'));
         if (::system(cmd.c_str()) != 0) {
             fprintf(stderr, "Warning: could not create WAL directory\n");
         }
     }
 
     // WAL for Kafka failure buffering
-    WAL wal(wal_path);
+    WAL wal(cfg.wal_path);
 
     // Kafka producer: on failure, write to WAL
-    KafkaProducer kafka(kafka_brokers, kafka_topic,
+    KafkaProducer kafka(cfg.kafka_brokers, cfg.kafka_topic,
         [&wal, &kafka_failed](const std::string& json) {
             kafka_failed++;
             wal.append(json);
@@ -132,6 +135,7 @@ int main(int argc, char **argv) {
 
     Debouncer debouncer(debounce_quiet, debounce_max_wait, send_event);
     g_debouncer = &debouncer;
+    g_watch_prefix = cfg.watch_prefix;
 
     // Open, load, attach BPF
     struct probe_bpf *skel = probe_bpf__open_and_load();

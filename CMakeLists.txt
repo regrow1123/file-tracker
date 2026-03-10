@@ -43,6 +43,7 @@ add_custom_command(
 # Main executable
 add_executable(file-tracker
     src/main.cpp
+    src/config.cpp
     src/debouncer.cpp
     src/kafka_producer.cpp
     src/wal.cpp
@@ -51,6 +52,7 @@ add_executable(file-tracker
 target_include_directories(file-tracker PRIVATE
     ${CMAKE_BINARY_DIR}
     ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/third_party
     ${LIBBPF_INCLUDE_DIRS}
     ${RDKAFKA_INCLUDE_DIRS}
 )
