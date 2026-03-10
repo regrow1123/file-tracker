@@ -83,4 +83,11 @@ int BPF_KPROBE(trace_do_truncate, struct mnt_idmap *idmap,
     return emit_event(dentry, EVENT_MTIME);
 }
 
+SEC("kprobe/vfs_utimes")
+int BPF_KPROBE(trace_vfs_utimes, const struct path *path)
+{
+    struct dentry *dentry = BPF_CORE_READ(path, dentry);
+    return emit_event(dentry, EVENT_MTIME);
+}
+
 char LICENSE[] SEC("license") = "GPL";
