@@ -33,8 +33,8 @@
 
 | 항목 | 사양 |
 |------|------|
-| OS | RHEL 9 |
-| 커널 | 5.14+ (eBPF CO-RE, BTF 지원) |
+| OS | RHEL 9, RHEL 10 |
+| 커널 | 5.14+ (RHEL9), 6.12+ (RHEL10) — eBPF CO-RE, BTF 지원 |
 | 서버 규모 | 수백 대 |
 | 파일시스템 | 무관 (VFS 레벨 후킹) |
 
@@ -89,7 +89,8 @@
 
 | 리스크 | 대응 |
 |--------|------|
-| RHEL9 커널 5.14의 eBPF 제약 | CO-RE + BTF로 호환성 확보, kprobe 폴백 |
+| RHEL9 커널 5.14의 eBPF 제약 | CO-RE + BTF로 호환성 확보, fentry 시도 → kprobe 폴백 |
+| RHEL9/10 커널 차이 | CO-RE 단일 바이너리, 런타임 커널 감지로 최적 경로 자동 선택 |
 | 대량 write 시 이벤트 폭주 | 커널 레벨 경로 필터 + 유저스페이스 중복 제거 |
 | 경로 해석 비용 (dentry → full path) | d_path helper 사용, 해석 실패 시 fd 기반 폴백 |
 | ring buffer 오버플로 | 버퍼 크기 튜닝 + 드롭 카운터 모니터링 |

@@ -40,6 +40,9 @@
 
 각 노드에서 독립 실행. 중앙 서버 불필요.
 
+**지원 OS**: RHEL 9 (커널 5.14), RHEL 10 (커널 6.12)
+CO-RE 단일 바이너리로 양쪽 모두 동작.
+
 ## 2. eBPF 프로그램 설계
 
 ### 2.1 후킹 대상
@@ -70,9 +73,11 @@ int trace_unlink(struct pt_regs *ctx) {
 }
 ```
 
-**주의**: 커널 5.14에서 `bpf_d_path()`는 제한적. `task_file` 기반 접근이 필요할 수 있음. 대안:
-- kretprobe에서 반환값 확인 후 경로 해석
-- dentry 구조체에서 직접 이름 추출 (부모 순회)
+**커널별 분기**:
+- RHEL10 (6.12): `bpf_loop()` + dentry 순회로 깊이 제한 완화, fentry 안정 지원
+- RHEL9 (5.14): `bpf_d_path()` 제한적 (fentry/fexit만), bounded loop verifier 보수적
+  - fentry attach 시도 → 실패 시 kprobe 폴백
+  - dentry 수동 순회 깊이 32단계 고정
 
 ### 2.3 이벤트 구조체
 
@@ -243,7 +248,7 @@ file = "/var/log/file-tracker/agent.log"
 
 ### 5.1 빌드 요구사항
 
-- RHEL9 빌드 환경
+- RHEL9 또는 RHEL10 빌드 환경
 - clang/llvm (BPF 프로그램 컴파일)
 - libbpf-devel
 - librdkafka-devel
@@ -310,13 +315,16 @@ WantedBy=multi-user.target
 - 유저스페이스에서 readlink(`/proc/<pid>/fd/<fd>`)
 - 프로세스 종료 시 fd 해석 불가 → 삭제 이벤트에서 문제
 
-**결정**: 전략 2를 기본으로 사용. 전략 1은 RHEL9에서 검증 후 가능하면 전환.
+**결정**: 런타임 커널 감지로 자동 선택.
+- RHEL10: 전략 1 (bpf_d_path) 시도 → 불가 시 전략 2 (dentry 순회 + bpf_loop)
+- RHEL9: 전략 2 (dentry 순회, bounded loop 깊이 32 고정)
+- 전략 3은 삭제 이벤트에서 fd 해석 불가하므로 사용 안 함
 
 ## 8. 알려진 제약
 
 | 제약 | 영향 | 대응 |
 |------|------|------|
-| 경로 깊이 32단계 제한 | 극단적 중첩 디렉토리 미지원 | 설정으로 조정 가능 |
+| 경로 깊이 32단계 제한 (RHEL9) | 극단적 중첩 디렉토리 미지원 | RHEL10에서는 bpf_loop()로 완화 |
 | rename 미추적 | rename은 mtime 미변경 | PRD 범위 외 (필요 시 확장) |
 | hardlink 삭제 | nlink > 1일 때 실제 삭제 아님 | 이벤트에 unlink로 기록, 소비자가 판단 |
 | NFS 등 원격 FS | 서버 측 변경은 클라이언트 eBPF 미감지 | 각 노드 로컬 이벤트만 추적 (PRD 범위) |
