@@ -23,8 +23,9 @@ public:
     // Must be called periodically to fire expired timers
     void tick();
 
-    // Flush all pending entries immediately (for graceful shutdown)
-    void flush_all();
+    // Flush all pending entries immediately (for graceful shutdown).
+    // Returns number of entries flushed.
+    size_t flush_all();
 
     // Number of pending entries
     size_t pending() const;

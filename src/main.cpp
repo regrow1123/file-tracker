@@ -32,6 +32,25 @@ static std::string get_hostname() {
     return "unknown";
 }
 
+// Build JSON event string
+static std::string build_json(int64_t ts_ms, const char *event_type,
+                               const std::string& path, const std::string& hostname) {
+    std::string json = "{\"ts\":";
+    json += std::to_string(ts_ms);
+    json += ",\"event\":\"";
+    json += event_type;
+    json += "\",\"path\":\"";
+    for (char c : path) {
+        if (c == '"') json += "\\\"";
+        else if (c == '\\') json += "\\\\";
+        else json += c;
+    }
+    json += "\",\"hostname\":\"";
+    json += hostname;
+    json += "\"}";
+    return json;
+}
+
 // Globals for ring buffer callback
 static Debouncer *g_debouncer = nullptr;
 static std::string g_watch_prefix;
@@ -105,30 +124,17 @@ int main(int argc, char **argv) {
 
     // Debouncer callback
     auto send_event = [&](const std::string& path, uint32_t event_type) {
-        std::string type_str = (event_type == EVENT_DELETE) ? "delete" : "mtime_change";
-        auto now = std::chrono::system_clock::now();
+        const char *type_str = (event_type == EVENT_DELETE) ? "delete" : "mtime_change";
         auto ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            now.time_since_epoch()).count();
+            std::chrono::system_clock::now().time_since_epoch()).count();
 
-        std::string json = "{\"ts\":";
-        json += std::to_string(ts_ms);
-        json += ",\"event\":\"";
-        json += type_str;
-        json += "\",\"path\":\"";
-        for (char c : path) {
-            if (c == '"') json += "\\\"";
-            else if (c == '\\') json += "\\\\";
-            else json += c;
-        }
-        json += "\",\"hostname\":\"";
-        json += hostname;
-        json += "\"}";
+        std::string json = build_json(ts_ms, type_str, path, hostname);
 
         if (kafka.send(json, hostname)) {
             kafka_sent++;
         }
 
-        Log::debug("[%s] %s", type_str.c_str(), path.c_str());
+        Log::debug("[%s] %s", type_str, path.c_str());
     };
 
     Debouncer debouncer(debounce_quiet, debounce_max_wait, send_event);
@@ -250,8 +256,8 @@ int main(int argc, char **argv) {
     Log::info("Shutting down...");
 
     // Flush all pending debounce entries
-    debouncer.flush_all();
-    Log::info("Flushed %zu debounce entries", (size_t)0);  // already flushed
+    size_t flushed = debouncer.flush_all();
+    Log::info("Flushed %zu debounce entries", flushed);
 
     // Final stats
     uint64_t total_events = read_percpu_counter(counters_fd, 1);

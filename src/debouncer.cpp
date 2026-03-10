@@ -64,7 +64,7 @@ void Debouncer::tick() {
     }
 }
 
-void Debouncer::flush_all() {
+size_t Debouncer::flush_all() {
     std::vector<std::pair<std::string, uint32_t>> to_fire;
 
     {
@@ -78,6 +78,7 @@ void Debouncer::flush_all() {
     for (auto& [path, evt] : to_fire) {
         cb_(path, evt);
     }
+    return to_fire.size();
 }
 
 size_t Debouncer::pending() const {
