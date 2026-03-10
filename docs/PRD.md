@@ -68,10 +68,10 @@
 - 전송 실패 시 로컬 WAL(Write-Ahead Log)에 버퍼링
 - Kafka 복구 후 WAL에서 재전송 (at-least-once)
 
-### 6.4 중복 제거
+### 6.4 중복 제거 (Debounce)
 
-- 동일 파일에 대한 연속 write 이벤트는 시간 윈도우(예: 1초) 내 중복 제거
-- 삭제 이벤트는 중복 제거 없이 즉시 전달
+- 동일 파일에 대한 mtime 변경 이벤트는 debounce 처리: 마지막 이벤트 후 quiet period(기본 1초) 경과 시 1건만 전달
+- 삭제 이벤트는 debounce 없이 즉시 전달
 
 ## 7. 비기능 요구사항
 

@@ -124,28 +124,34 @@ Kafka 전송 시도
     └─ 실패 → WAL 기록
 ```
 
-### 3.3 중복 제거 상세
+### 3.3 중복 제거 상세 (Debounce)
 
 mtime 변경은 단일 파일에 대해 초당 수백 회 발생 가능 (대용량 write). 중복 제거 없이는 Kafka 폭주.
 
+**Debounce 방식**: 이벤트가 계속 들어오는 동안은 전송하지 않고, 마지막 이벤트 후 quiet period(기본 1초) 동안 새 이벤트가 없으면 그때 1건만 전송.
+
 ```
-HashMap<PathBuf, Instant>
+HashMap<PathBuf, TimerHandle>
 
 on_event(path, event_type):
     if event_type == DELETE:
-        send(event)  // 즉시 전달
+        // 삭제는 즉시 전달, 진행 중인 debounce 타이머 취소
+        cancel_timer(path)
         map.remove(path)
+        send(event)
         return
 
-    // mtime_change
-    if let Some(last_ts) = map.get(path):
-        if now - last_ts < 1s:
-            return  // 중복 제거
-    map.insert(path, now)
-    send(event)
+    // mtime_change → debounce
+    if map.contains(path):
+        cancel_timer(path)  // 기존 타이머 리셋
+    map.insert(path, schedule_after(1s, || {
+        send(mtime_change_event(path))
+        map.remove(path)
+    }))
 ```
 
-중복 제거 윈도우는 설정 파일로 조정 가능하게 한다.
+결과: 대용량 write가 10분 걸려도 완료 후 1건만 전송.
+debounce 윈도우는 설정 파일로 조정 가능.
 
 ### 3.4 WAL (Write-Ahead Log)
 
