@@ -3,6 +3,7 @@
 #include <cstring>
 #include <csignal>
 #include <string>
+#include <functional>
 #include <chrono>
 #include <thread>
 #include <unistd.h>
@@ -55,11 +56,50 @@ static std::string build_json(int64_t ts_ms, const char *event_type,
 static Debouncer *g_debouncer = nullptr;
 static std::string g_watch_prefix;
 
+// Rename pairing state: holds rename_from path until rename_to arrives
+static std::string g_pending_rename_from;
+static bool g_has_pending_rename = false;
+
+// Rename callback (set in main)
+static std::function<void(const std::string&, const std::string&)> g_send_rename;
+
+static void send_rename(const std::string& old_path, const std::string& new_path) {
+    if (g_send_rename) g_send_rename(old_path, new_path);
+}
+
 static int handle_event(void *ctx, void *data, size_t data_sz) {
     auto *evt = static_cast<struct file_event *>(data);
     std::string path = build_path(evt);
 
-    // Userspace prefix filter
+    if (evt->event_type == EVENT_RENAME_FROM) {
+        // Store and wait for the matching rename_to
+        g_pending_rename_from = path;
+        g_has_pending_rename = true;
+        return 0;
+    }
+
+    if (evt->event_type == EVENT_RENAME_TO) {
+        if (g_has_pending_rename) {
+            // Pair with previous rename_from
+            bool old_match = g_pending_rename_from.compare(
+                0, g_watch_prefix.size(), g_watch_prefix) == 0;
+            bool new_match = path.compare(
+                0, g_watch_prefix.size(), g_watch_prefix) == 0;
+
+            if (old_match || new_match) {
+                send_rename(g_pending_rename_from, path);
+            }
+            g_has_pending_rename = false;
+        }
+        return 0;
+    }
+
+    // Flush any orphaned rename_from (shouldn't happen normally)
+    if (g_has_pending_rename) {
+        g_has_pending_rename = false;
+    }
+
+    // Userspace prefix filter for delete/mtime events
     if (path.compare(0, g_watch_prefix.size(), g_watch_prefix) != 0) return 0;
 
     g_debouncer->on_event(path, evt->event_type);
@@ -122,16 +162,9 @@ int main(int argc, char **argv) {
         }
     );
 
-    // Debouncer callback
+    // Debouncer callback (delete + mtime_change only)
     auto send_event = [&](const std::string& path, uint32_t event_type) {
-        const char *type_str;
-        switch (event_type) {
-            case EVENT_DELETE:      type_str = "delete"; break;
-            case EVENT_MTIME:       type_str = "mtime_change"; break;
-            case EVENT_RENAME_FROM: type_str = "rename_from"; break;
-            case EVENT_RENAME_TO:   type_str = "rename_to"; break;
-            default:                type_str = "unknown"; break;
-        }
+        const char *type_str = (event_type == EVENT_DELETE) ? "delete" : "mtime_change";
         auto ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
 
@@ -142,6 +175,40 @@ int main(int argc, char **argv) {
         }
 
         Log::debug("[%s] %s", type_str, path.c_str());
+    };
+
+    // Rename callback: single JSON with old_path + new_path
+    g_send_rename = [&](const std::string& old_path, const std::string& new_path) {
+        auto ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
+        // Cancel any pending debounce for old path (file moved away)
+        // and new path (file moved here, supersedes pending mtime)
+        // These are no-ops if paths aren't in debounce map
+
+        std::string json = "{\"ts\":";
+        json += std::to_string(ts_ms);
+        json += ",\"event\":\"rename\",\"old_path\":\"";
+        for (char c : old_path) {
+            if (c == '"') json += "\\\"";
+            else if (c == '\\') json += "\\\\";
+            else json += c;
+        }
+        json += "\",\"new_path\":\"";
+        for (char c : new_path) {
+            if (c == '"') json += "\\\"";
+            else if (c == '\\') json += "\\\\";
+            else json += c;
+        }
+        json += "\",\"hostname\":\"";
+        json += hostname;
+        json += "\"}";
+
+        if (kafka.send(json, hostname)) {
+            kafka_sent++;
+        }
+
+        Log::debug("[rename] %s -> %s", old_path.c_str(), new_path.c_str());
     };
 
     Debouncer debouncer(debounce_quiet, debounce_max_wait, send_event);

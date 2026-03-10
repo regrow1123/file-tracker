@@ -7,10 +7,9 @@ Debouncer::Debouncer(std::chrono::milliseconds quiet_period,
     : quiet_period_(quiet_period), max_wait_(max_wait), cb_(std::move(cb)) {}
 
 void Debouncer::on_event(const std::string& path, uint32_t event_type) {
-    // Delete and rename events bypass debounce entirely
-    if (event_type == EVENT_DELETE ||
-        event_type == EVENT_RENAME_FROM ||
-        event_type == EVENT_RENAME_TO) {
+    // Delete events bypass debounce entirely
+    // (rename events are handled separately before reaching debouncer)
+    if (event_type == EVENT_DELETE) {
         {
             std::lock_guard<std::mutex> lock(mu_);
             entries_.erase(path);
