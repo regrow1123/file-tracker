@@ -8,6 +8,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Find required packages
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBBPF REQUIRED libbpf)
+pkg_check_modules(RDKAFKA REQUIRED rdkafka)
 
 # Paths
 set(BPF_SRC ${CMAKE_SOURCE_DIR}/src/bpf/probe.bpf.c)
@@ -42,19 +43,23 @@ add_custom_command(
 # Main executable
 add_executable(file-tracker
     src/main.cpp
+    src/debouncer.cpp
+    src/kafka_producer.cpp
 )
 
-# Skeleton is a generated header
 target_include_directories(file-tracker PRIVATE
-    ${CMAKE_BINARY_DIR}     # for probe.skel.h
+    ${CMAKE_BINARY_DIR}
     ${CMAKE_SOURCE_DIR}/include
     ${LIBBPF_INCLUDE_DIRS}
+    ${RDKAFKA_INCLUDE_DIRS}
 )
 
 target_link_libraries(file-tracker PRIVATE
     ${LIBBPF_LIBRARIES}
+    ${RDKAFKA_LIBRARIES}
     elf
     z
+    pthread
 )
 
 # Ensure skeleton is generated before compiling main

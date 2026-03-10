@@ -1,0 +1,65 @@
+#include "debouncer.h"
+#include "common.h"
+
+Debouncer::Debouncer(std::chrono::milliseconds quiet_period,
+                     std::chrono::milliseconds max_wait,
+                     Callback cb)
+    : quiet_period_(quiet_period), max_wait_(max_wait), cb_(std::move(cb)) {}
+
+void Debouncer::on_event(const std::string& path, uint32_t event_type) {
+    if (event_type == EVENT_DELETE) {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            entries_.erase(path);
+        }
+        cb_(path, event_type);
+        return;
+    }
+
+    // mtime_change → debounce
+    std::lock_guard<std::mutex> lock(mu_);
+    auto now = Clock::now();
+    auto it = entries_.find(path);
+    if (it != entries_.end()) {
+        // Check max_wait
+        if (now - it->second.first_seen >= max_wait_) {
+            entries_.erase(it);
+            // Unlock before callback to avoid holding lock during I/O
+            mu_.unlock();
+            cb_(path, event_type);
+            mu_.lock();
+            // Reset with new first_seen
+            entries_[path] = {now, now};
+            return;
+        }
+        it->second.last_seen = now;
+    } else {
+        entries_[path] = {now, now};
+    }
+}
+
+void Debouncer::tick() {
+    std::vector<std::pair<std::string, uint32_t>> to_fire;
+
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto now = Clock::now();
+        for (auto it = entries_.begin(); it != entries_.end(); ) {
+            if (now - it->second.last_seen >= quiet_period_) {
+                to_fire.emplace_back(it->first, EVENT_MTIME);
+                it = entries_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    for (auto& [path, evt] : to_fire) {
+        cb_(path, evt);
+    }
+}
+
+size_t Debouncer::pending() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return entries_.size();
+}
