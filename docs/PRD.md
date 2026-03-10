@@ -71,6 +71,7 @@
 ### 6.4 중복 제거 (Debounce)
 
 - 동일 파일에 대한 mtime 변경 이벤트는 debounce 처리: 마지막 이벤트 후 quiet period(기본 1초) 경과 시 1건만 전달
+- 무한 write 방지: 첫 이벤트 후 max wait(기본 1시간) 경과 시 강제 전송
 - 삭제 이벤트는 debounce 없이 즉시 전달
 
 ## 7. 비기능 요구사항
