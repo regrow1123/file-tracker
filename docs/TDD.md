@@ -128,7 +128,7 @@ Kafka 전송 시도
 
 mtime 변경은 단일 파일에 대해 초당 수백 회 발생 가능 (대용량 write). 중복 제거 없이는 Kafka 폭주.
 
-**Debounce 방식**: 이벤트가 계속 들어오는 동안은 전송하지 않고, 마지막 이벤트 후 quiet period(기본 1초) 동안 새 이벤트가 없으면 그때 1건만 전송.
+**Debounce 방식**: 이벤트가 계속 들어오는 동안은 전송하지 않고, 마지막 이벤트 후 quiet period(기본 10초) 동안 새 이벤트가 없으면 그때 1건만 전송.
 
 **Max wait**: debounce 중 무한 write(로그 파일 등)로 타이머가 영원히 리셋되는 것을 방지. 첫 이벤트 후 max_wait(기본 1시간) 경과 시 write가 계속돼도 강제 전송.
 
@@ -156,13 +156,13 @@ on_event(path, event_type):
             send(mtime_change_event)
             entry.first_seen = now
         cancel_timer(path)
-        entry.timer = schedule_after(1s, || {
+        entry.timer = schedule_after(10s, || {
             send(mtime_change_event(path))
             map.remove(path)
         })
     else:
         map.insert(path, DebouncerEntry {
-            timer: schedule_after(1s, || {
+            timer: schedule_after(10s, || {
                 send(mtime_change_event(path))
                 map.remove(path)
             }),
@@ -217,7 +217,7 @@ debounce 윈도우와 max_wait 모두 설정 파일로 조정 가능.
 
 [watch]
 paths = ["/home"]              # 감시 대상 경로 prefix
-debounce_ms = 1000             # debounce quiet period (ms)
+debounce_ms = 10000            # debounce quiet period (ms)
 max_wait_sec = 3600            # 무한 write 강제 전송 주기 (초, 기본 1시간)
 
 [kafka]
