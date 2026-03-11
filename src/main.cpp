@@ -1,5 +1,4 @@
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <csignal>
 #include <string>
@@ -7,6 +6,7 @@
 #include <chrono>
 #include <thread>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 
@@ -33,6 +33,29 @@ static std::string get_hostname() {
     return "unknown";
 }
 
+// Escape string for JSON (handles control characters)
+static void json_escape(std::string& out, const std::string& s) {
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += static_cast<char>(c);
+                }
+        }
+    }
+}
+
 // Build JSON event string
 static std::string build_json(int64_t ts_ms, const char *event_type,
                                const std::string& path, const std::string& hostname) {
@@ -41,68 +64,59 @@ static std::string build_json(int64_t ts_ms, const char *event_type,
     json += ",\"event\":\"";
     json += event_type;
     json += "\",\"path\":\"";
-    for (char c : path) {
-        if (c == '"') json += "\\\"";
-        else if (c == '\\') json += "\\\\";
-        else json += c;
-    }
+    json_escape(json, path);
     json += "\",\"hostname\":\"";
-    json += hostname;
+    json_escape(json, hostname);
     json += "\"}";
     return json;
 }
 
-// Globals for ring buffer callback
-static Debouncer *g_debouncer = nullptr;
-static std::string g_watch_prefix;
+// Event handler context — passed to ring buffer callback via ctx pointer
+struct EventCtx {
+    Debouncer *debouncer = nullptr;
+    std::string watch_prefix;
+    std::function<void(const std::string&, const std::string&)> on_rename;
 
-// Rename pairing state: holds rename_from path until rename_to arrives
-static std::string g_pending_rename_from;
-static bool g_has_pending_rename = false;
-
-// Rename callback (set in main)
-static std::function<void(const std::string&, const std::string&)> g_send_rename;
-
-static void send_rename(const std::string& old_path, const std::string& new_path) {
-    if (g_send_rename) g_send_rename(old_path, new_path);
-}
+    // Rename pairing state
+    std::string pending_rename_from;
+    bool has_pending_rename = false;
+};
 
 static int handle_event(void *ctx, void *data, size_t data_sz) {
+    auto *ectx = static_cast<EventCtx*>(ctx);
     auto *evt = static_cast<struct file_event *>(data);
     std::string path = build_path(evt);
 
     if (evt->event_type == EVENT_RENAME_FROM) {
-        // Store and wait for the matching rename_to
-        g_pending_rename_from = path;
-        g_has_pending_rename = true;
+        ectx->pending_rename_from = path;
+        ectx->has_pending_rename = true;
         return 0;
     }
 
     if (evt->event_type == EVENT_RENAME_TO) {
-        if (g_has_pending_rename) {
-            // Pair with previous rename_from
-            bool old_match = g_pending_rename_from.compare(
-                0, g_watch_prefix.size(), g_watch_prefix) == 0;
+        if (ectx->has_pending_rename) {
+            bool old_match = ectx->pending_rename_from.compare(
+                0, ectx->watch_prefix.size(), ectx->watch_prefix) == 0;
             bool new_match = path.compare(
-                0, g_watch_prefix.size(), g_watch_prefix) == 0;
+                0, ectx->watch_prefix.size(), ectx->watch_prefix) == 0;
 
             if (old_match || new_match) {
-                send_rename(g_pending_rename_from, path);
+                ectx->on_rename(ectx->pending_rename_from, path);
             }
-            g_has_pending_rename = false;
+            ectx->has_pending_rename = false;
         }
         return 0;
     }
 
     // Flush any orphaned rename_from (shouldn't happen normally)
-    if (g_has_pending_rename) {
-        g_has_pending_rename = false;
+    if (ectx->has_pending_rename) {
+        ectx->has_pending_rename = false;
     }
 
     // Userspace prefix filter for delete/mtime events
-    if (path.compare(0, g_watch_prefix.size(), g_watch_prefix) != 0) return 0;
+    if (path.compare(0, ectx->watch_prefix.size(), ectx->watch_prefix) != 0) return 0;
 
-    g_debouncer->on_event(path, evt->event_type);
+    ectx->debouncer->on_event(path, evt->event_type);
     return 0;
 }
 
@@ -138,11 +152,18 @@ int main(int argc, char **argv) {
     uint64_t kafka_failed = 0;
     uint64_t wal_replayed = 0;
 
-    // Create WAL directory
+    // Create WAL directory (recursive mkdir)
     {
         std::string dir = cfg.wal_path.substr(0, cfg.wal_path.rfind('/'));
-        std::string cmd = "mkdir -p " + dir;
-        if (::system(cmd.c_str()) != 0) {
+        std::string acc;
+        for (size_t i = 0; i < dir.size(); i++) {
+            acc += dir[i];
+            if (dir[i] == '/' || i == dir.size() - 1) {
+                ::mkdir(acc.c_str(), 0755);
+            }
+        }
+        struct stat st;
+        if (stat(dir.c_str(), &st) != 0) {
             Log::warn("Could not create WAL directory: %s", dir.c_str());
         }
     }
@@ -177,31 +198,23 @@ int main(int argc, char **argv) {
         Log::debug("[%s] %s", type_str, path.c_str());
     };
 
-    // Rename callback: single JSON with old_path + new_path
-    g_send_rename = [&](const std::string& old_path, const std::string& new_path) {
+    Debouncer debouncer(debounce_quiet, debounce_max_wait, send_event);
+
+    EventCtx ectx;
+    ectx.debouncer = &debouncer;
+    ectx.watch_prefix = cfg.watch_prefix;
+    ectx.on_rename = [&](const std::string& old_path, const std::string& new_path) {
         auto ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
-
-        // Cancel any pending debounce for old path (file moved away)
-        // and new path (file moved here, supersedes pending mtime)
-        // These are no-ops if paths aren't in debounce map
 
         std::string json = "{\"ts\":";
         json += std::to_string(ts_ms);
         json += ",\"event\":\"rename\",\"old_path\":\"";
-        for (char c : old_path) {
-            if (c == '"') json += "\\\"";
-            else if (c == '\\') json += "\\\\";
-            else json += c;
-        }
+        json_escape(json, old_path);
         json += "\",\"new_path\":\"";
-        for (char c : new_path) {
-            if (c == '"') json += "\\\"";
-            else if (c == '\\') json += "\\\\";
-            else json += c;
-        }
+        json_escape(json, new_path);
         json += "\",\"hostname\":\"";
-        json += hostname;
+        json_escape(json, hostname);
         json += "\"}";
 
         if (kafka.send(json, hostname)) {
@@ -210,10 +223,6 @@ int main(int argc, char **argv) {
 
         Log::debug("[rename] %s -> %s", old_path.c_str(), new_path.c_str());
     };
-
-    Debouncer debouncer(debounce_quiet, debounce_max_wait, send_event);
-    g_debouncer = &debouncer;
-    g_watch_prefix = cfg.watch_prefix;
 
     // Open, load, attach BPF
     struct probe_bpf *skel = probe_bpf__open_and_load();
@@ -231,7 +240,7 @@ int main(int argc, char **argv) {
 
     struct ring_buffer *rb = ring_buffer__new(
         bpf_map__fd(skel->maps.events),
-        handle_event, nullptr, nullptr
+        handle_event, &ectx, nullptr
     );
     if (!rb) {
         Log::error("Failed to create ring buffer");
