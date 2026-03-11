@@ -1,340 +1,330 @@
-# TDD: 파일 변경/삭제 실시간 추적 시스템 기술 설계
+# TDD: 파일 변경 추적 및 증분 스냅샷 백업 시스템 기술 설계
 
-## 1. 아키텍처 개요
+## 1. 시스템 아키텍처
 
 ```
-┌─────────────────────────────────────────────────┐
-│                   Linux Kernel                   │
-│                                                  │
-│  ┌──────────┐  ┌──────────┐  ┌───────────────┐  │
-│  │ kprobe:  │  │ kprobe:  │  │ kprobe:       │  │
-│  │ unlink   │  │ vfs_write│  │ utimensat     │  │
-│  └────┬─────┘  └────┬─────┘  └──────┬────────┘  │
-│       │              │               │           │
-│       └──────────┬───┘───────────────┘           │
-│                  │                                │
-│          ┌───────▼────────┐                      │
-│          │  BPF Ring Buf  │                      │
-│          └───────┬────────┘                      │
-└──────────────────┼───────────────────────────────┘
-                   │
-┌──────────────────┼───────────────────────────────┐
-│   Userspace      │                               │
-│          ┌───────▼────────┐                      │
-│          │  Event Reader  │                      │
-│          └───────┬────────┘                      │
-│                  │                                │
-│          ┌───────▼────────┐                      │
-│          │   Dedup Filter │  (time-window)       │
-│          └───────┬────────┘                      │
-│                  │                                │
-│          ┌───────▼────────┐                      │
-│          │  Kafka Producer│◄──┐                  │
-│          └───────┬────────┘   │                  │
-│                  │            │                  │
-│            ┌─────▼─────┐  ┌──┴───┐              │
-│            │   Kafka   │  │  WAL │              │
-│            └───────────┘  └──────┘              │
-└──────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  노드 (수백 대, Lustre)                                   │
+│  ┌──────────────────────────────────────────────────┐    │
+│  │  file-tracker (에이전트)                           │    │
+│  │                                                   │    │
+│  │  Kernel:                                          │    │
+│  │   kprobe(5종) → inode dedup(LRU) → ring buffer    │    │
+│  │                                                   │    │
+│  │  Userspace:                                       │    │
+│  │   path 조립 → /home 필터 → debounce → Kafka       │    │
+│  │                                    └→ WAL(실패시)  │    │
+│  └──────────────────────────────────────────────────┘    │
+└────────────────────────┬─────────────────────────────────┘
+                         │
+                    ┌────▼────┐
+                    │  Kafka  │
+                    └────┬────┘
+                         │
+┌────────────────────────▼─────────────────────────────────┐
+│  중앙 서버                                                │
+│  ┌──────────────────────────────────────────────────┐    │
+│  │  backup-consumer (소비자)                          │    │
+│  │                                                   │    │
+│  │  Kafka consumer → 변경 DB (중복 제거)              │    │
+│  │                        │                          │    │
+│  │  백업 트리거 (cron/수동)                            │    │
+│  │       │                                           │    │
+│  │       ▼                                           │    │
+│  │  노드에서 파일 pull (SSH/rsync)                     │    │
+│  │       │                                           │    │
+│  │       ▼                                           │    │
+│  │  restic backup → MinIO (S3)                       │    │
+│  │       │                                           │    │
+│  │  offset commit + 변경 DB 정리                      │    │
+│  └──────────────────────────────────────────────────┘    │
+│                                                          │
+│  ┌──────────────────┐                                    │
+│  │  MinIO (S3)      │ ← restic 리포지토리               │
+│  │  청크 dedup      │ ← 버전별 스냅샷                    │
+│  └──────────────────┘                                    │
+└──────────────────────────────────────────────────────────┘
 ```
 
-각 노드에서 독립 실행. 중앙 서버 불필요.
+---
 
-**지원 OS**: RHEL 9 (커널 5.14), RHEL 10 (커널 6.12)
-CO-RE 단일 바이너리로 양쪽 모두 동작.
+# Part A: 에이전트 (file-tracker) — 구현 완료
 
-## 2. eBPF 프로그램 설계
+## 2. eBPF 프로그램
 
-### 2.1 후킹 대상
+### 2.1 kprobe 대상
 
-VFS 레벨 함수를 kprobe로 후킹하여 파일시스템 무관 동작 보장.
+| 이벤트 | kprobe | 비고 |
+|--------|--------|------|
+| 삭제 | `vfs_unlink` | unlink/unlinkat 포괄 |
+| 쓰기 | `vfs_write` | write/pwrite64 포괄 |
+| 절단 | `do_truncate` | truncate/ftruncate 포괄 |
+| 시간변경 | `vfs_utimes` | utimensat/utime 포괄 |
+| 이름변경 | `vfs_rename` | rename/renameat2 포괄 |
 
-| 이벤트 | 후킹 포인트 | 비고 |
-|--------|------------|------|
-| 삭제 | `vfs_unlink` | unlink, unlinkat 포괄 |
-| 쓰기 | `vfs_write` | write, pwrite64 포괄 |
-| 절단 | `do_truncate` | truncate, ftruncate 포괄 |
-| 시간변경 | `vfs_utimes` 또는 `do_utimes` | utimensat, utime 포괄 |
+### 2.2 BPF Maps
 
-> VFS 함수 후킹으로 syscall 개별 후킹 대비 후크 수를 줄이고, 파일시스템 계층 무관 동작을 보장한다.
-
-### 2.2 경로 필터링 (커널 레벨)
-
-```c
-// BPF 프로그램 내 경로 prefix 검사
-// d_path()로 full path 획득 후 /home prefix 확인
-// 불일치 시 즉시 return → ring buffer 미전송
-
-SEC("kprobe/vfs_unlink")
-int trace_unlink(struct pt_regs *ctx) {
-    // 1. dentry에서 경로 추출
-    // 2. /home prefix 검사 → 불일치 시 return 0
-    // 3. ring buffer로 이벤트 전송
-}
-```
-
-**커널별 분기**:
-- RHEL10 (6.12): `bpf_loop()` + dentry 순회로 깊이 제한 완화, fentry 안정 지원
-- RHEL9 (5.14): `bpf_d_path()` 제한적 (fentry/fexit만), bounded loop verifier 보수적
-  - fentry attach 시도 → 실패 시 kprobe 폴백
-  - dentry 수동 순회 깊이 32단계 고정
+| Map | 타입 | 용도 |
+|-----|------|------|
+| `events` | RINGBUF (16MB) | 이벤트 전달 |
+| `scratch` | PERCPU_ARRAY | 이벤트 조립용 임시 버퍼 |
+| `counters` | PERCPU_ARRAY (3항목) | drops/total/dedup 카운터 |
+| `dedup` | LRU_HASH (100K) | inode 기반 1초 mtime 중복 억제 |
 
 ### 2.3 이벤트 구조체
 
 ```c
 struct file_event {
-    u64 ts_ns;          // ktime_get_ns()
-    u32 event_type;     // 0=delete, 1=mtime_change
-    char path[4096];    // full path
+    u64 ts_ns;
+    u32 event_type;     // 0=delete, 1=mtime, 2=rename_from, 3=rename_to
+    u32 depth;
+    char names[20][256]; // dentry 컴포넌트 배열 (유저스페이스에서 조립)
 };
 ```
 
-### 2.4 Ring Buffer
+### 2.4 CO-RE 호환
 
-- BPF ring buffer 사용 (perf buffer 대비 오버헤드 낮음)
-- 기본 크기: 16MB (튜닝 가능)
-- 오버플로 시 드롭 카운터 증가 → 유저스페이스에서 모니터링
+- `void *idmap_or_userns`: vfs_unlink/do_truncate 첫 인자 (5.14 vs 6.x)
+- `struct renamedata *`: vfs_rename (5.12+ 동일)
+- BTF 기반 오프셋 자동 패치
 
-## 3. 유저스페이스 데몬 설계
+## 3. 유저스페이스 데몬
 
-### 3.1 기술 선택
+### 3.1 기술 스택
 
-| 항목 | 선택 | 사유 |
-|------|------|------|
-| 언어 | C 또는 Rust | 저수준 제어, 낮은 오버헤드 |
-| BPF 라이브러리 | libbpf (CO-RE) | RHEL9 기본 지원, BTF 활용 |
-| Kafka 클라이언트 | librdkafka | C/Rust 바인딩 성숙 |
-| WAL | 커스텀 (append-only file) | 단순 구조, 외부 의존성 제거 |
+| 항목 | 선택 |
+|------|------|
+| 언어 | C++ (C++20) |
+| BPF | libbpf (CO-RE) |
+| Kafka | librdkafka (lz4 압축) |
+| 설정 | toml++ (header-only) |
+| WAL | 커스텀 append-only (CRC32) |
 
-### 3.2 이벤트 처리 파이프라인
+### 3.2 이벤트 처리
 
 ```
-Ring Buffer Poll
+Ring Buffer Poll (100ms)
     │
-    ▼
-경로 유효성 검사 (path가 비어있거나 해석 실패 시 폐기)
-    │
-    ▼
-중복 제거 필터
-    │  - HashMap<path, last_event_ts>
-    │  - mtime_change: 동일 경로 1초 윈도우 내 중복 제거
-    │  - delete: 중복 제거 없이 즉시 통과
-    ▼
-직렬화 (JSON)
-    │
-    ▼
-Kafka 전송 시도
-    │
-    ├─ 성공 → 완료
-    └─ 실패 → WAL 기록
+    ├─ rename_from → 페어링 대기
+    ├─ rename_to → from과 합쳐서 단일 rename JSON 전송
+    ├─ delete → debounce bypass, 즉시 전송
+    └─ mtime → /home 필터 → debouncer (10s quiet, 1h max)
+                                │
+                                ▼
+                          Kafka send
+                          ├─ 성공 → 완료
+                          └─ 실패 → WAL 기록
 ```
 
-### 3.3 중복 제거 상세 (Debounce)
+### 3.3 성능 (부하 테스트 결과)
 
-mtime 변경은 단일 파일에 대해 초당 수백 회 발생 가능 (대용량 write). 중복 제거 없이는 Kafka 폭주.
+| 항목 | 결과 (130만 IOPS) |
+|------|-------------------|
+| CPU | 0.24% |
+| RSS | 43MB |
+| ring buffer drops | 0 |
+| BPF dedup rate | 99.99% |
 
-**Debounce 방식**: 이벤트가 계속 들어오는 동안은 전송하지 않고, 마지막 이벤트 후 quiet period(기본 10초) 동안 새 이벤트가 없으면 그때 1건만 전송.
+### 3.4 배포
 
-**Max wait**: debounce 중 무한 write(로그 파일 등)로 타이머가 영원히 리셋되는 것을 방지. 첫 이벤트 후 max_wait(기본 1시간) 경과 시 write가 계속돼도 강제 전송.
+- systemd unit: `LimitMEMLOCK=infinity`, `MemoryMax=100M`, `CPUQuota=5%`
+- RPM: `make deps && make deps-rdkafka && make rpm`
+- 설정: `/etc/file-tracker/config.toml`
 
-```
-HashMap<PathBuf, DebouncerEntry>
+---
 
-struct DebouncerEntry {
-    timer: TimerHandle,
-    first_seen: Instant,
-}
+# Part B: 소비자 (backup-consumer) — 설계
 
-on_event(path, event_type):
-    if event_type == DELETE:
-        // 삭제는 즉시 전달, 진행 중인 debounce 타이머 취소
-        cancel_timer(path)
-        map.remove(path)
-        send(delete_event)
-        return
+## 4. 소비자 아키텍처
 
-    // mtime_change → debounce
-    if let Some(entry) = map.get(path):
-        if now - entry.first_seen > max_wait(1h):
-            // max wait 초과 → 강제 전송 후 리셋
-            cancel_timer(path)
-            send(mtime_change_event)
-            entry.first_seen = now
-        cancel_timer(path)
-        entry.timer = schedule_after(10s, || {
-            send(mtime_change_event(path))
-            map.remove(path)
-        })
-    else:
-        map.insert(path, DebouncerEntry {
-            timer: schedule_after(10s, || {
-                send(mtime_change_event(path))
-                map.remove(path)
-            }),
-            first_seen: now,
-        })
-```
-
-엣지 케이스 처리:
-- **무한 write**: max_wait(1h) 후 강제 전송, first_seen 리셋하여 다음 주기 시작
-- **debounce 중 삭제**: 타이머 취소, delete만 전송 (mtime_change는 삭제된 파일이므로 무의미)
-- **메모리**: active write 중인 파일 수만큼만 HashMap 유지, 타이머 만료 시 즉시 제거
-
-debounce 윈도우와 max_wait 모두 설정 파일로 조정 가능.
-
-### 3.4 WAL (Write-Ahead Log)
+### 4.1 컴포넌트
 
 ```
-구조: append-only 바이너리 파일
-┌──────────┬──────────┬──────────┐
-│ header   │ record 1 │ record 2 │ ...
-│ (magic,  │ (len,    │ (len,    │
-│  version)│  data,   │  data,   │
-│          │  crc32)  │  crc32)  │
-└──────────┴──────────┴──────────┘
+┌─────────────────────────────────────────────┐
+│  backup-consumer                             │
+│                                              │
+│  ┌─────────────┐   ┌──────────────────────┐ │
+│  │ Kafka       │──▶│ Event Processor      │ │
+│  │ Consumer    │   │ - 이벤트 파싱         │ │
+│  └─────────────┘   │ - 변경 DB upsert     │ │
+│                     └──────────────────────┘ │
+│                                              │
+│  ┌─────────────────────────────────────────┐ │
+│  │ Backup Scheduler                        │ │
+│  │ - cron 또는 수동 트리거                   │ │
+│  │ - 노드별 변경 파일 목록 생성              │ │
+│  │ - 노드에서 파일 pull                     │ │
+│  │ - restic backup 실행                    │ │
+│  │ - 완료 시 변경 DB 정리 + offset commit   │ │
+│  └─────────────────────────────────────────┘ │
+│                                              │
+│  ┌─────────────┐   ┌──────────────────────┐ │
+│  │ API Server  │   │ 변경 DB              │ │
+│  │ (선택)      │   │ (Redis/PostgreSQL)   │ │
+│  └─────────────┘   └──────────────────────┘ │
+└──────────────────────────────────────────────┘
 ```
 
-- 위치: `/var/lib/file-tracker/wal/`
-- Kafka 전송 실패 시 WAL에 기록
-- 백그라운드 스레드가 주기적으로 WAL → Kafka 재전송 시도
-- 전송 완료된 레코드는 체크포인트로 표시
-- WAL 파일이 임계치(예: 1GB) 초과 시 전송 완료분 truncate
+### 4.2 변경 DB 스키마
 
-### 3.5 Kafka 메시지 형식
+```sql
+CREATE TABLE changed_files (
+    hostname    TEXT NOT NULL,
+    path        TEXT NOT NULL,
+    event       TEXT NOT NULL,   -- mtime_change, delete, rename
+    old_path    TEXT,            -- rename인 경우
+    event_ts    BIGINT NOT NULL,
+    created_at  TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (hostname, path)
+);
 
-```json
-{
-  "ts": 1710000000000,
-  "event": "delete",
-  "path": "/home/user1/data/file.txt",
-  "hostname": "node-001"
-}
+-- upsert: 같은 (hostname, path)에 대해 최신 이벤트만 유지
 ```
 
-- 토픽: `file-tracker-events` (설정 가능)
-- 파티션 키: hostname (노드별 순서 보장)
-- 압축: lz4
+### 4.3 이벤트 처리 규칙
 
-## 4. 설정
+| Kafka 이벤트 | 변경 DB 동작 |
+|-------------|-------------|
+| `mtime_change` path=A | UPSERT (host, A) → mtime_change |
+| `delete` path=A | UPSERT (host, A) → delete |
+| `rename` old=A new=B | DELETE (host, A) + UPSERT (host, B) → rename |
+
+### 4.4 백업 실행 흐름
+
+```
+1. 변경 DB에서 hostname별 변경 파일 목록 추출
+2. 노드별로:
+   a. mtime_change 파일 목록 → /tmp/backup_list_{hostname}.txt
+   b. SSH로 노드 접속, restic backup 실행:
+      restic backup \
+        --files-from /tmp/backup_list_{hostname}.txt \
+        --repo s3:http://minio:9000/backup-{hostname} \
+        --tag incremental
+   c. delete 파일 → 별도 기록 (restic은 자동 관리)
+   d. rename → old_path는 무시, new_path만 백업
+3. 백업 완료 → 변경 DB에서 처리된 항목 제거
+4. Kafka offset commit
+```
+
+### 4.5 restic 리포지토리 구조
+
+```
+MinIO:
+  s3://backup-node001/    ← node-001의 restic 리포지토리
+  s3://backup-node002/    ← node-002의 restic 리포지토리
+  ...
+
+각 리포지토리 내부 (restic 관리):
+  /config
+  /data/       ← 청크 dedup된 데이터
+  /index/
+  /keys/
+  /locks/
+  /snapshots/  ← 시점별 스냅샷 메타데이터
+```
+
+### 4.6 스냅샷 관리
+
+```bash
+# 스냅샷 목록
+restic snapshots -r s3:http://minio:9000/backup-node001
+
+# 특정 시점 파일 복원
+restic restore <snapshot-id> \
+  --target /restore \
+  --include /home/user/file.txt \
+  -r s3:http://minio:9000/backup-node001
+
+# 오래된 스냅샷 정리 (90일 보존)
+restic forget --keep-within 90d --prune \
+  -r s3:http://minio:9000/backup-node001
+```
+
+### 4.7 풀스캔 보정
+
+이벤트 유실 대비 주기적 풀스캔:
+
+```
+매주 일요일 새벽:
+  1. 각 노드에서 find /home -type f 실행
+  2. 결과를 현재 restic 스냅샷과 비교
+  3. 차이 있는 파일만 백업
+```
+
+## 5. 기술 선택지
+
+### 5.1 소비자 언어
+
+| 선택지 | 장점 | 단점 |
+|--------|------|------|
+| Python | 빠른 개발, kafka-python/confluent-kafka | 성능 (우리 규모에선 충분) |
+| Go | 단일 바이너리, sarama/confluent-kafka-go | |
+| Java | Kafka 네이티브 | 무거움 |
+
+**추천: Python** — 소비자는 I/O 바운드(Kafka read + SSH + restic 호출), CPU 집약 아님.
+
+### 5.2 변경 DB
+
+| 선택지 | 장점 | 단점 |
+|--------|------|------|
+| Redis | 빠름, 간단 | 영속성 설정 필요 |
+| PostgreSQL | 쿼리 강력, 트랜잭션 | 무거움 |
+| SQLite | 단일 파일, 무설치 | 단일 프로세스 |
+
+**추천: Redis** — upsert가 핵심 연산, 빠르고 간단. 소비자 1대면 SQLite도 가능.
+
+## 6. 설정
+
+### 6.1 소비자 설정
 
 ```toml
-# /etc/file-tracker/config.toml
-
-[watch]
-paths = ["/home"]              # 감시 대상 경로 prefix
-debounce_ms = 10000            # debounce quiet period (ms)
-max_wait_sec = 3600            # 무한 write 강제 전송 주기 (초, 기본 1시간)
+# /etc/backup-consumer/config.toml
 
 [kafka]
 brokers = "kafka01:9092,kafka02:9092"
 topic = "file-tracker-events"
-compression = "lz4"
-batch_size = 1000
-linger_ms = 100
+group_id = "backup-consumer"
 
-[wal]
-dir = "/var/lib/file-tracker/wal"
-max_size_mb = 1024
+[backup]
+schedule = "0 3 * * *"           # 매일 새벽 3시
+restic_binary = "/usr/bin/restic"
+minio_endpoint = "http://minio:9000"
+minio_access_key = "minioadmin"
+minio_secret_key = "minioadmin"
+bucket_prefix = "backup-"        # backup-{hostname}
 
-[ebpf]
-ring_buffer_size_mb = 16
+[db]
+type = "redis"                   # redis 또는 sqlite
+redis_url = "redis://localhost:6379/0"
 
-[logging]
-level = "info"
-file = "/var/log/file-tracker/agent.log"
+[nodes]
+ssh_user = "backup"
+ssh_key = "/etc/backup-consumer/id_rsa"
+# 노드 목록은 Kafka 이벤트의 hostname에서 자동 수집
+
+[fullscan]
+enabled = true
+schedule = "0 2 * 0"             # 매주 일요일 새벽 2시
 ```
 
-## 5. 빌드 및 배포
+## 7. 구현 단계
 
-### 5.1 빌드 요구사항
-
-- RHEL9 또는 RHEL10 빌드 환경
-- clang/llvm (BPF 프로그램 컴파일)
-- libbpf-devel
-- librdkafka-devel
-- kernel-devel + BTF 데이터 (`/sys/kernel/btf/vmlinux`)
-
-### 5.2 산출물
-
-```
-/usr/bin/file-tracker           # 유저스페이스 데몬
-/usr/lib/file-tracker/probe.o   # CO-RE BPF 오브젝트 (BTF 내장)
-/etc/file-tracker/config.toml   # 설정 파일
-/usr/lib/systemd/system/file-tracker.service  # systemd 유닛
-```
-
-### 5.3 systemd 유닛
-
-```ini
-[Unit]
-Description=File Change Tracker Agent
-After=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/file-tracker --config /etc/file-tracker/config.toml
-Restart=always
-RestartSec=5
-LimitMEMLOCK=infinity
-CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE
-
-[Install]
-WantedBy=multi-user.target
-```
-
-## 6. 모니터링
-
-에이전트는 다음 메트릭을 로그 또는 prometheus exporter로 노출:
-
-| 메트릭 | 설명 |
-|--------|------|
-| `events_total{type}` | 감지된 이벤트 수 (delete/mtime_change) |
-| `events_deduped_total` | 중복 제거된 이벤트 수 |
-| `events_dropped_total` | ring buffer 오버플로로 드롭된 수 |
-| `kafka_sent_total` | Kafka 전송 성공 수 |
-| `kafka_failed_total` | Kafka 전송 실패 수 |
-| `wal_size_bytes` | WAL 파일 현재 크기 |
-| `wal_pending_records` | 미전송 WAL 레코드 수 |
-
-## 7. 경로 해석 전략
-
-커널에서 full path 획득은 eBPF의 주요 난제 중 하나.
-
-### 전략 1: bpf_d_path() (선호)
-- 커널 5.10+에서 지원
-- 특정 BPF 프로그램 타입에서만 사용 가능 (fentry/fexit)
-- RHEL9 커널 5.14에서 사용 가능 여부 검증 필요
-
-### 전략 2: dentry 수동 순회
-- dentry → d_parent 체인을 따라 루트까지 순회
-- d_name에서 각 컴포넌트 추출 후 역순 조합
-- BPF 루프 제한(bounded loop)으로 깊이 제한 필요 (예: 최대 32단계)
-
-### 전략 3: fd → /proc/self/fd 유저스페이스 해석
-- 커널에서는 fd만 전달
-- 유저스페이스에서 readlink(`/proc/<pid>/fd/<fd>`)
-- 프로세스 종료 시 fd 해석 불가 → 삭제 이벤트에서 문제
-
-**결정**: 런타임 커널 감지로 자동 선택.
-- RHEL10: 전략 1 (bpf_d_path) 시도 → 불가 시 전략 2 (dentry 순회 + bpf_loop)
-- RHEL9: 전략 2 (dentry 순회, bounded loop 깊이 32 고정)
-- 전략 3은 삭제 이벤트에서 fd 해석 불가하므로 사용 안 함
+| Phase | 내용 | 의존성 | 예상 공수 |
+|-------|------|--------|----------|
+| **B-1** | 소비자 기본: Kafka consumer + 변경 DB (Redis) | Kafka, Redis | 1일 |
+| **B-2** | restic + MinIO 연동: 단일 노드 증분 백업 | MinIO, restic | 1일 |
+| **B-3** | 멀티 노드: SSH pull + 노드별 restic 리포지토리 | SSH 접근 | 1일 |
+| **B-4** | 스케줄러: cron 백업 + 스냅샷 정리 (forget/prune) | | 반나절 |
+| **B-5** | 풀스캔 보정: 주기적 전체 비교 + 차분 백업 | | 반나절 |
+| **B-6** | CLI/API: 스냅샷 조회, 파일 복원, 상태 확인 | | 1일 |
+| **B-7** | 운영: systemd, 로깅, 모니터링, 문서 | | 반나절 |
 
 ## 8. 알려진 제약
 
 | 제약 | 영향 | 대응 |
 |------|------|------|
-| 경로 깊이 32단계 제한 (RHEL9) | 극단적 중첩 디렉토리 미지원 | RHEL10에서는 bpf_loop()로 완화 |
-| rename 미추적 | rename은 mtime 미변경 | PRD 범위 외 (필요 시 확장) |
-| hardlink 삭제 | nlink > 1일 때 실제 삭제 아님 | 이벤트에 unlink로 기록, 소비자가 판단 |
-| NFS 등 원격 FS | 서버 측 변경은 클라이언트 eBPF 미감지 | 각 노드 로컬 이벤트만 추적 (PRD 범위) |
-
-## 9. 구현 단계
-
-| 단계 | 내용 | 산출물 |
-|------|------|--------|
-| Phase 1 | eBPF probe + 유저스페이스 이벤트 출력 (stdout) | 동작 검증 |
-| Phase 2 | 중복 제거 + Kafka 연동 | 기본 기능 완성 |
-| Phase 3 | WAL + 재전송 | 안정성 확보 |
-| Phase 4 | 설정 파일 + systemd + 패키징 | 배포 준비 |
-| Phase 5 | 모니터링 메트릭 + 운영 문서 | 운영 준비 |
+| 이벤트~pull 사이 파일 재변경 | 중간 버전 누락 가능 | 다음 이벤트에서 재백업 (최종 일관성) |
+| Kafka retention 초과 | 이벤트 유실 | 주기적 풀스캔 보정 |
+| 대용량 파일 pull 시 네트워크 부하 | 백업 시간 증가 | restic 청크 dedup으로 변경분만 전송 |
+| 삭제된 파일은 pull 불가 | 삭제 전 버전만 보존 | 이전 스냅샷에서 복원 가능 |
+| 노드 접근 불가 (다운) | 해당 노드 백업 건너뜀 | 다음 주기에 재시도, 변경 DB 유지 |
