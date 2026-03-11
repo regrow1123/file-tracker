@@ -21,6 +21,10 @@ use_tls = false
 [db]
 redis_url = "redis://localhost:6379/0"
 
+[prune]
+schedule = "0 4 * * 0"              # 매주 일요일 새벽 4시
+keep_days = 90
+
 [fullscan]
 enabled = true
 schedule = "0 2 * * 0"
