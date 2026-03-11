@@ -6,3 +6,4 @@ compile_commands.json
 .cache/
 rpm/*.rpm
 .vagrant/
+__pycache__/
