@@ -1,0 +1,26 @@
+[kafka]
+brokers = "localhost:9092"
+topic = "file-tracker-events"
+group_id = "backup-consumer"
+
+[backup]
+schedule = "0 3 * * *"
+restic_binary = "/usr/bin/restic"
+restic_password = "file-tracker-backup-2026"
+workers = 4
+base_path = "/home"
+repo_depth = 2
+
+[minio]
+endpoint = "localhost:9000"
+bucket = "file-tracker-backup"
+access_key = "minioadmin"
+secret_key = "minioadmin"
+use_tls = false
+
+[db]
+redis_url = "redis://localhost:6379/0"
+
+[fullscan]
+enabled = true
+schedule = "0 2 * * 0"
