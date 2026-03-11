@@ -297,14 +297,16 @@ int main(int argc, char **argv) {
             last_stats = now;
             uint64_t total_events = read_percpu_counter(counters_fd, 1);
             uint64_t total_drops = read_percpu_counter(counters_fd, 0);
+            uint64_t total_dedup = read_percpu_counter(counters_fd, 2);
             uint64_t new_drops = total_drops - prev_drops;
             prev_drops = total_drops;
 
-            Log::info("Stats: bpf_events=%llu bpf_drops=%llu(+%llu) kafka_sent=%llu "
-                      "kafka_failed=%llu wal_size=%llu pending=%zu",
+            Log::info("Stats: bpf_events=%llu bpf_drops=%llu(+%llu) bpf_dedup=%llu "
+                      "kafka_sent=%llu kafka_failed=%llu wal_size=%llu pending=%zu",
                       (unsigned long long)total_events,
                       (unsigned long long)total_drops,
                       (unsigned long long)new_drops,
+                      (unsigned long long)total_dedup,
                       (unsigned long long)kafka_sent,
                       (unsigned long long)kafka_failed,
                       (unsigned long long)wal.file_size(),
@@ -343,16 +345,20 @@ int main(int argc, char **argv) {
     Log::info("Flushed %zu debounce entries", flushed);
 
     // Final stats
-    uint64_t total_events = read_percpu_counter(counters_fd, 1);
-    uint64_t total_drops = read_percpu_counter(counters_fd, 0);
-    Log::info("Final stats: bpf_events=%llu bpf_drops=%llu kafka_sent=%llu "
-              "kafka_failed=%llu wal_replayed=%llu wal_size=%llu",
-              (unsigned long long)total_events,
-              (unsigned long long)total_drops,
-              (unsigned long long)kafka_sent,
-              (unsigned long long)kafka_failed,
-              (unsigned long long)wal_replayed,
-              (unsigned long long)wal.file_size());
+    {
+        uint64_t total_events = read_percpu_counter(counters_fd, 1);
+        uint64_t total_drops = read_percpu_counter(counters_fd, 0);
+        uint64_t total_dedup = read_percpu_counter(counters_fd, 2);
+        Log::info("Final stats: bpf_events=%llu bpf_drops=%llu bpf_dedup=%llu "
+                  "kafka_sent=%llu kafka_failed=%llu wal_replayed=%llu wal_size=%llu",
+                  (unsigned long long)total_events,
+                  (unsigned long long)total_drops,
+                  (unsigned long long)total_dedup,
+                  (unsigned long long)kafka_sent,
+                  (unsigned long long)kafka_failed,
+                  (unsigned long long)wal_replayed,
+                  (unsigned long long)wal.file_size());
+    }
 
     kafka.flush(15000);
     ring_buffer__free(rb);

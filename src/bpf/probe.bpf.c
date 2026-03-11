@@ -11,6 +11,9 @@
 #define EVENT_RENAME_FROM 2
 #define EVENT_RENAME_TO   3
 
+// Dedup interval for mtime events: 1 second in nanoseconds
+#define DEDUP_INTERVAL_NS 1000000000ULL
+
 struct file_event {
     __u64 ts_ns;
     __u32 event_type;
@@ -30,13 +33,22 @@ struct {
     __type(value, struct file_event);
 } scratch SEC(".maps");
 
-// Drop counter: index 0 = ringbuf drops, index 1 = total events
+// Drop counter: index 0 = ringbuf drops, index 1 = total events, index 2 = dedup skipped
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 2);
+    __uint(max_entries, 3);
     __type(key, __u32);
     __type(value, __u64);
 } counters SEC(".maps");
+
+// Dedup map: inode -> last emit timestamp (ns)
+// LRU automatically evicts oldest entries when full
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 100000);
+    __type(key, __u64);
+    __type(value, __u64);
+} dedup SEC(".maps");
 
 static __always_inline int emit_event(struct dentry *dentry, __u32 event_type)
 {
@@ -89,10 +101,30 @@ int BPF_KPROBE(trace_vfs_unlink, void *idmap_or_userns,
     return emit_event(dentry, EVENT_DELETE);
 }
 
+// Dedup check for mtime events: skip if same inode emitted within DEDUP_INTERVAL_NS
+static __always_inline int dedup_check(struct dentry *dentry)
+{
+    __u64 ino = BPF_CORE_READ(dentry, d_inode, i_ino);
+    __u64 now = bpf_ktime_get_ns();
+    __u64 *last = bpf_map_lookup_elem(&dedup, &ino);
+
+    if (last && (now - *last) < DEDUP_INTERVAL_NS) {
+        // Recently emitted — skip and count
+        __u32 idx_dedup = 2;
+        __u64 *cnt = bpf_map_lookup_elem(&counters, &idx_dedup);
+        if (cnt) __sync_fetch_and_add(cnt, 1);
+        return 1;  // skip
+    }
+
+    bpf_map_update_elem(&dedup, &ino, &now, BPF_ANY);
+    return 0;  // emit
+}
+
 SEC("kprobe/vfs_write")
 int BPF_KPROBE(trace_vfs_write, struct file *file)
 {
     struct dentry *dentry = BPF_CORE_READ(file, f_path.dentry);
+    if (dedup_check(dentry)) return 0;
     return emit_event(dentry, EVENT_MTIME);
 }
 
@@ -100,6 +132,7 @@ SEC("kprobe/do_truncate")
 int BPF_KPROBE(trace_do_truncate, void *idmap_or_userns,
                struct dentry *dentry)
 {
+    if (dedup_check(dentry)) return 0;
     return emit_event(dentry, EVENT_MTIME);
 }
 
