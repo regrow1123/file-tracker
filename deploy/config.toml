@@ -1,0 +1,17 @@
+[kafka]
+brokers = "kafka.example.com:9092"
+topic = "file-tracker-events"
+
+[debounce]
+quiet_ms = 10000
+max_wait_ms = 3600000
+
+[wal]
+path = "/var/lib/file-tracker/wal.log"
+max_size_mb = 1024
+
+[watch]
+prefix = "/home"
+
+[logging]
+level = "info"

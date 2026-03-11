@@ -1,0 +1,38 @@
+[Unit]
+Description=eBPF File Change Tracker
+Documentation=https://github.com/regrow1123/file-tracker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/file-tracker /etc/file-tracker/config.toml
+Restart=on-failure
+RestartSec=5
+
+# BPF requires root
+User=root
+
+# BPF map memory locking
+LimitMEMLOCK=infinity
+
+# Resource limits
+MemoryMax=100M
+CPUQuota=5%
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/var/lib/file-tracker
+PrivateTmp=yes
+ProtectKernelModules=yes
+RestrictRealtime=yes
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=file-tracker
+
+[Install]
+WantedBy=multi-user.target
