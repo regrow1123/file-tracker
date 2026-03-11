@@ -255,9 +255,21 @@ HSET pending "/home/stor2/deptC/proj/c.txt" '{"event":"rename","old_path":"...",
 
 | Kafka 이벤트 | Redis 동작 |
 |-------------|-----------|
-| `mtime_change` path=A | `HSET pending A '{"event":"mtime_change"}'` |
-| `delete` path=A | `HSET pending A '{"event":"delete"}'` |
-| `rename` old=A new=B | `HDEL pending A` + `HSET pending B '{"event":"rename","old_path":"A"}'` |
+| `mtime_change` path=A | ts 비교 후 `HSET pending A '{"event":"mtime_change","ts":...}'` |
+| `delete` path=A | ts 비교 후 `HSET pending A '{"event":"delete","ts":...}'` |
+| `rename` old=A new=B | `HDEL pending A` + `HSET pending B '{"event":"rename","old_path":"A","ts":...}'` |
+
+**timestamp 비교**: 이벤트 순서 역전 방지. Lustre 공유 환경에서 여러 노드의 이벤트가 다른 Kafka 파티션을 거쳐 순서가 뒤바뀔 수 있다. 기존 ts보다 오래된 이벤트는 무시:
+
+```python
+def upsert_event(path, event, ts):
+    existing = redis.hget("pending", path)
+    if existing:
+        old_ts = json.loads(existing)["ts"]
+        if ts <= old_ts:
+            return  # 오래된 이벤트 → 무시
+    redis.hset("pending", path, json.dumps({"event": event, "ts": ts}))
+```
 
 ### 4.7 백업 실행 흐름
 
