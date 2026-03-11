@@ -18,11 +18,16 @@ log = logging.getLogger("consumer")
 
 
 class EventProcessor:
-    """Kafka 이벤트를 Redis pending Hash에 upsert."""
+    """Kafka 이벤트를 Redis pending Hash에 upsert.
+
+    - delete 이벤트는 무시 (백업할 대상 없음, 이전 스냅샷에 보존)
+    - ts 비교 없이 단순 HSET (Lustre 현재 상태를 직접 읽으므로 순서 무관)
+    - RENAME 방식으로 backup과 분리되므로 레이스 없음
+    """
 
     def __init__(self, redis_client: redis.Redis):
         self.r = redis_client
-        self.stats = {"processed": 0, "skipped_old": 0, "errors": 0}
+        self.stats = {"processed": 0, "skipped_delete": 0, "errors": 0}
 
     def process(self, msg_value: bytes):
         try:
@@ -33,14 +38,18 @@ class EventProcessor:
             return
 
         event_type = event.get("event")
-        ts = event.get("ts", 0)
+
+        if event_type == "delete":
+            self.stats["skipped_delete"] += 1
+            self.stats["processed"] += 1
+            return
 
         if event_type == "rename":
-            self._handle_rename(event, ts)
-        elif event_type in ("mtime_change", "delete"):
+            self._handle_rename(event)
+        elif event_type == "mtime_change":
             path = event.get("path")
             if path:
-                self._upsert(path, event_type, ts)
+                self.r.hset("pending", path, event_type)
         else:
             log.warning("알 수 없는 이벤트: %s", event_type)
             self.stats["errors"] += 1
@@ -48,32 +57,17 @@ class EventProcessor:
 
         self.stats["processed"] += 1
 
-    def _handle_rename(self, event: dict, ts: int):
+    def _handle_rename(self, event: dict):
         old_path = event.get("old_path")
         new_path = event.get("new_path")
         if not old_path or not new_path:
             log.warning("rename 이벤트에 old_path/new_path 없음: %s", event)
             self.stats["errors"] += 1
             return
-        # old_path 제거
-        self.r.hdel("pending", old_path)
-        # new_path upsert
-        info = json.dumps({"event": "rename", "old_path": old_path, "ts": ts})
-        self.r.hset("pending", new_path, info)
-
-    def _upsert(self, path: str, event_type: str, ts: int):
-        existing = self.r.hget("pending", path)
-        if existing:
-            try:
-                old_ts = json.loads(existing)["ts"]
-                if ts <= old_ts:
-                    self.stats["skipped_old"] += 1
-                    return
-            except (json.JSONDecodeError, KeyError):
-                pass  # 기존 데이터 손상 → 덮어쓰기
-
-        info = json.dumps({"event": event_type, "ts": ts})
-        self.r.hset("pending", path, info)
+        pipe = self.r.pipeline()
+        pipe.hdel("pending", old_path)
+        pipe.hset("pending", new_path, "rename")
+        pipe.execute()
 
 
 def main():
@@ -129,17 +123,17 @@ def main():
             if processor.stats["processed"] - last_log_count >= 100:
                 last_log_count = processor.stats["processed"]
                 pending = r.hlen("pending")
-                log.info("처리: %d건, 스킵(오래됨): %d, 에러: %d, pending: %d",
+                log.info("처리: %d건, 삭제스킵: %d, 에러: %d, pending: %d",
                          processor.stats["processed"],
-                         processor.stats["skipped_old"],
+                         processor.stats["skipped_delete"],
                          processor.stats["errors"],
                          pending)
     finally:
         consumer.close()
         pending = r.hlen("pending")
-        log.info("종료. 총 처리: %d건, 스킵: %d, 에러: %d, pending: %d",
+        log.info("종료. 총 처리: %d건, 삭제스킵: %d, 에러: %d, pending: %d",
                  processor.stats["processed"],
-                 processor.stats["skipped_old"],
+                 processor.stats["skipped_delete"],
                  processor.stats["errors"],
                  pending)
 

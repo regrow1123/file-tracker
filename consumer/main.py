@@ -171,8 +171,9 @@ def main():
             if processor.stats["processed"] - last_log_count >= 1000:
                 last_log_count = processor.stats["processed"]
                 pending = r.hlen("pending")
-                log.info("이벤트: %d건, pending: %d",
-                         processor.stats["processed"], pending)
+                log.info("이벤트: %d건, 삭제스킵: %d, pending: %d",
+                         processor.stats["processed"],
+                         processor.stats["skipped_delete"], pending)
     finally:
         kafka_consumer.close()
         log.info("종료. 총 이벤트: %d건", processor.stats["processed"])

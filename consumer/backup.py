@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""backup-consumer: Redis pending → restic 증분 백업"""
+"""backup-consumer: Redis pending → restic 증분 백업
+
+RENAME 방식: pending → processing 원자적 swap으로 consumer와 간섭 차단.
+"""
 
 import json
 import os
 import subprocess
 import tempfile
+import threading
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import redis
@@ -29,157 +33,155 @@ def get_repo_id(path: str, base: str, depth: int) -> str | None:
     return "/".join(parts[:depth])
 
 
-def ensure_repo(repo_url: str, env: dict, initialized: set) -> bool:
-    """restic repo가 없으면 init. 이미 확인했으면 skip."""
-    if repo_url in initialized:
-        return True
-    result = subprocess.run(
-        ["restic", "cat", "config", "-r", repo_url],
-        capture_output=True, env=env
-    )
-    if result.returncode != 0:
-        log.info("repo 초기화: %s", repo_url)
+class RepoManager:
+    """restic repo 초기화 관리. thread-safe."""
+
+    def __init__(self):
+        self._initialized = set()
+        self._lock = threading.Lock()
+
+    def ensure(self, repo_url: str, env: dict) -> bool:
+        with self._lock:
+            if repo_url in self._initialized:
+                return True
+
+        # lock 밖에서 restic 호출 (I/O 블로킹)
         result = subprocess.run(
-            ["restic", "init", "-r", repo_url],
+            ["restic", "cat", "config", "-r", repo_url],
             capture_output=True, env=env
         )
         if result.returncode != 0:
-            log.error("repo init 실패: %s: %s", repo_url, result.stderr.decode())
-            return False
-    initialized.add(repo_url)
-    return True
+            log.info("repo 초기화: %s", repo_url)
+            result = subprocess.run(
+                ["restic", "init", "-r", repo_url],
+                capture_output=True, env=env
+            )
+            if result.returncode != 0:
+                log.error("repo init 실패: %s: %s",
+                          repo_url, result.stderr.decode())
+                return False
+
+        with self._lock:
+            self._initialized.add(repo_url)
+        return True
 
 
-def backup_repo(repo_id: str, files: dict, cfg: dict, env: dict,
-                initialized: set) -> dict:
-    """단일 repo에 대해 restic backup 실행. 결과 dict 반환."""
-    bucket = cfg["minio"]["bucket"]
+def backup_repo(repo_id: str, paths: list[str], cfg: dict, env: dict,
+                repo_mgr: RepoManager) -> dict:
+    """단일 repo에 대해 restic backup 실행."""
     endpoint = cfg["minio"]["endpoint"]
+    bucket = cfg["minio"]["bucket"]
     repo_url = f"s3:http://{endpoint}/{bucket}/{repo_id}"
 
-    result = {"repo_id": repo_id, "total": len(files),
-              "backed_up": 0, "deleted": 0, "errors": 0}
+    result = {"repo_id": repo_id, "total": len(paths),
+              "backed_up": 0, "skipped": 0, "errors": 0}
 
-    if not ensure_repo(repo_url, env, initialized):
-        result["errors"] = len(files)
+    if not repo_mgr.ensure(repo_url, env):
+        result["errors"] = len(paths)
         return result
 
-    # mtime_change, rename → 백업 대상 (파일이 존재하는 것만)
-    backup_list = []
-    for path, info_str in files.items():
-        info = json.loads(info_str)
-        if info["event"] == "delete":
-            result["deleted"] += 1
-            continue
-        if os.path.exists(path):
-            backup_list.append(path)
-        else:
-            log.debug("파일 없음 (이미 삭제?): %s", path)
+    # 존재하는 파일만 필터
+    existing = [p for p in paths if os.path.exists(p)]
+    result["skipped"] = len(paths) - len(existing)
 
-    if backup_list:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt",
-                                         delete=False) as f:
-            f.write("\n".join(backup_list))
-            list_file = f.name
+    if not existing:
+        log.info("repo=%s 백업 대상 없음 (모두 삭제됨)", repo_id)
+        return result
 
-        try:
-            proc = subprocess.run(
-                ["restic", "backup", "--files-from", list_file,
-                 "-r", repo_url, "--tag", "incremental"],
-                capture_output=True, env=env, timeout=3600
-            )
-            if proc.returncode == 0:
-                result["backed_up"] = len(backup_list)
-                log.info("repo=%s 백업 완료: %d건", repo_id, len(backup_list))
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt",
+                                     delete=False) as f:
+        f.write("\n".join(existing))
+        list_file = f.name
+
+    try:
+        proc = subprocess.run(
+            ["restic", "backup", "--files-from", list_file,
+             "-r", repo_url, "--tag", "incremental"],
+            capture_output=True, env=env, timeout=3600
+        )
+        if proc.returncode in (0, 3):  # 3 = incomplete (일부 파일 누락)
+            result["backed_up"] = len(existing)
+            if proc.returncode == 3:
+                log.warning("repo=%s 일부 파일 누락: %d건", repo_id, len(existing))
             else:
-                stderr = proc.stderr.decode()
-                # 파일 없는 경고는 무시 (백업 중 삭제될 수 있음)
-                if proc.returncode == 3:  # restic: incomplete snapshot
-                    result["backed_up"] = len(backup_list)
-                    log.warning("repo=%s 일부 파일 누락 (incomplete): %d건",
-                                repo_id, len(backup_list))
-                else:
-                    log.error("repo=%s 백업 실패: %s", repo_id, stderr[:200])
-                    result["errors"] = len(backup_list)
-        finally:
-            os.unlink(list_file)
-    else:
-        log.info("repo=%s 백업 대상 없음 (delete만 %d건)", repo_id, result["deleted"])
+                log.info("repo=%s 백업 완료: %d건", repo_id, len(existing))
+        else:
+            log.error("repo=%s 백업 실패: %s",
+                      repo_id, proc.stderr.decode()[:200])
+            result["errors"] = len(existing)
+    finally:
+        os.unlink(list_file)
 
     return result
 
 
 def run_backup(cfg: dict, r: redis.Redis):
-    """전체 백업 실행: Redis pending → repo별 그룹핑 → 병렬 restic backup."""
+    """전체 백업: RENAME으로 pending 스냅샷 → repo별 병렬 restic backup."""
 
-    # 1. Redis에서 전체 pending 추출
-    all_items = r.hgetall("pending")
-    if not all_items:
-        log.info("백업 대상 없음")
+    # 1. 원자적 swap: pending → processing
+    try:
+        r.rename("pending", "processing")
+    except redis.exceptions.ResponseError:
+        log.info("백업 대상 없음 (pending 비어있음)")
         return
 
-    log.info("총 %d건 pending", len(all_items))
+    # 이 시점부터 consumer는 새 pending에 쓰기 (HSET이 자동 생성)
 
-    # 2. repo별 그룹핑
+    # 2. processing에서 전체 추출
+    all_items = r.hgetall("processing")
+    log.info("총 %d건 processing", len(all_items))
+
+    # 3. repo별 그룹핑
     base = cfg["backup"]["base_path"]
     depth = cfg["backup"]["repo_depth"]
-    tasks = {}  # {repo_id: {path: info}}
-    skipped = []
+    tasks = {}  # {repo_id: [path, ...]}
+    skipped = 0
 
-    for path, info in all_items.items():
+    for path in all_items:
         repo_id = get_repo_id(path, base, depth)
         if repo_id is None:
-            skipped.append(path)
+            skipped += 1
             continue
-        tasks.setdefault(repo_id, {})[path] = info
+        tasks.setdefault(repo_id, []).append(path)
 
     if skipped:
-        log.warning("repo 매핑 실패 (depth 부족): %d건", len(skipped))
+        log.warning("repo 매핑 실패 (depth 부족): %d건", skipped)
 
     log.info("repo %d개로 분배", len(tasks))
 
-    # 3. restic 환경변수
+    # 4. restic 환경변수
     env = os.environ.copy()
     env["RESTIC_PASSWORD"] = cfg["backup"]["restic_password"]
     env["AWS_ACCESS_KEY_ID"] = cfg["minio"]["access_key"]
     env["AWS_SECRET_ACCESS_KEY"] = cfg["minio"]["secret_key"]
 
-    initialized = set()
+    repo_mgr = RepoManager()
     workers = cfg["backup"].get("workers", 4)
 
-    # 4. Worker pool로 병렬 실행
-    total_stats = {"backed_up": 0, "deleted": 0, "errors": 0}
+    # 5. Worker pool로 병렬 실행
+    total = {"backed_up": 0, "skipped": 0, "errors": 0}
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(backup_repo, repo_id, files, cfg, env, initialized): repo_id
-            for repo_id, files in tasks.items()
+            pool.submit(backup_repo, repo_id, paths, cfg, env, repo_mgr): repo_id
+            for repo_id, paths in tasks.items()
         }
-
         for future in as_completed(futures):
             repo_id = futures[future]
             try:
-                result = future.result()
-                total_stats["backed_up"] += result["backed_up"]
-                total_stats["deleted"] += result["deleted"]
-                total_stats["errors"] += result["errors"]
-
-                # 성공한 항목만 Redis에서 제거
-                if result["errors"] == 0:
-                    for path in tasks[repo_id]:
-                        r.hdel("pending", path)
+                res = future.result()
+                total["backed_up"] += res["backed_up"]
+                total["skipped"] += res["skipped"]
+                total["errors"] += res["errors"]
             except Exception as e:
                 log.error("repo=%s 예외: %s", repo_id, e)
-                total_stats["errors"] += len(tasks[repo_id])
+                total["errors"] += len(tasks[repo_id])
 
-    # 5. skipped 항목도 Redis에서 제거 (repo 매핑 안 되는 경로)
-    for path in skipped:
-        r.hdel("pending", path)
+    # 6. processing 삭제 (에러 있어도 삭제 — 재시도는 다음 이벤트에서)
+    r.delete("processing")
 
-    remaining = r.hlen("pending")
-    log.info("백업 완료. 백업: %d, 삭제기록: %d, 에러: %d, 남은 pending: %d",
-             total_stats["backed_up"], total_stats["deleted"],
-             total_stats["errors"], remaining)
+    log.info("백업 완료. 백업: %d, 스킵: %d, 에러: %d",
+             total["backed_up"], total["skipped"], total["errors"])
 
 
 def main():
