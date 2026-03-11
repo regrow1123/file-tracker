@@ -1,0 +1,13 @@
+Vagrant.configure("2") do |config|
+  config.vm.box = "cloud-image/centos-10-stream"
+  config.vm.hostname = "centos10-test"
+
+  config.vm.provider :libvirt do |lv|
+    lv.memory = 2048
+    lv.cpus = 2
+  end
+
+  config.vm.synced_folder "../../", "/home/vagrant/file-tracker",
+    type: "rsync",
+    rsync__exclude: [".vagrant/", ".git/", "build/", "docs/", "memory/"]
+end

@@ -1,0 +1,1 @@
+{"rsync":{"/home/vagrant/file-tracker":{"type":"rsync","rsync__exclude":[".vagrant/",".git/","build/","docs/","memory/"],"guestpath":"/home/vagrant/file-tracker","hostpath":"/home/sund4y/.openclaw/workspace/file-tracker","disabled":false,"__vagrantfile":true,"exclude":[".vagrant/",".git/","build/","docs/","memory/"],"owner":"vagrant","group":"vagrant"}}}
