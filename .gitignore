@@ -5,3 +5,4 @@ include/vmlinux.h
 compile_commands.json
 .cache/
 rpm/*.rpm
+.vagrant/
