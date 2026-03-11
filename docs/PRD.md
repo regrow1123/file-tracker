@@ -37,9 +37,10 @@
 |------|------|
 | 입력 | Kafka 이벤트 스트림 |
 | 기능 | 변경 파일 중복 제거 → 증분 백업 실행 |
-| 백업 도구 | restic (청크 기반 dedup, 스냅샷 관리) |
+| 백업 도구 | kopia (청크 dedup, 동시 쓰기, 스냅샷 관리) |
 | 백업 스토리지 | MinIO (S3 호환 오브젝트 스토리지) |
-| 복원 | restic 스냅샷에서 시점 기반 파일 복원 |
+| 병렬 백업 | N개 worker가 단일 kopia 리포지토리에 동시 쓰기 |
+| 복원 | kopia 스냅샷에서 시점 기반 파일 복원 |
 
 ## 4. 비목표
 
@@ -55,7 +56,7 @@
 | OS | RHEL 9, RHEL 10 |
 | 커널 | 5.14+ (RHEL9), 6.12+ (RHEL10) — eBPF CO-RE, BTF 지원 |
 | 서버 규모 | 수백 대 |
-| 파일시스템 | Lustre (VFS 레벨 후킹으로 무관) |
+| 파일시스템 | Lustre (공유 마운트, VFS 레벨 후킹으로 무관) |
 | 백업 스토리지 | MinIO (S3 호환) |
 
 ## 6. 기능 요구사항
@@ -99,18 +100,19 @@
 ### 6.6 소비자: 증분 백업 실행
 
 - 주기적 (매일 새벽 등) 또는 수동 트리거
-- 변경 DB에서 노드별 변경 파일 목록 추출
-- 각 노드에서 변경된 파일만 restic으로 백업:
+- 변경 DB에서 변경 파일 목록 추출 → N개 worker에 분배
+- Lustre 공유 마운트이므로 어떤 worker든 파일 접근 가능
+- 각 worker가 kopia로 병렬 백업 (단일 리포지토리, 동시 쓰기):
   ```
-  restic backup --files-from=changed_files.txt -r s3:http://minio:9000/backup
+  kopia snapshot create --file-list batch.txt
   ```
 - 백업 완료 시 변경 DB 해당 항목 제거 + Kafka offset commit
 
 ### 6.7 소비자: 스냅샷 복원
 
-- restic 스냅샷 목록 조회 → 시점 선택 → 파일/디렉토리 복원
+- kopia 스냅샷 목록 조회 → 시점 선택 → 파일/디렉토리 복원
   ```
-  restic restore <snapshot-id> --target /restore --include /home/user/file.txt
+  kopia restore <snapshot-id>/home/user/file.txt /restore/file.txt
   ```
 
 ## 7. 비기능 요구사항
@@ -140,7 +142,7 @@
 |--------|------|
 | 이벤트 수신~파일 pull 사이 파일 재변경 | 다음 이벤트에서 재백업, 최종 일관성 |
 | 소비자 장기 다운 시 Kafka retention 초과 | 풀스캔 백업으로 보정 (주 1회 등) |
-| 대용량 파일 백업 시 네트워크 부하 | restic 청크 dedup으로 변경분만 전송 |
+| 대용량 파일 백업 시 네트워크 부하 | kopia 청크 dedup으로 변경분만 전송 |
 | MinIO 장애 | restic 재시도, 소비자 일시 정지 |
 
 ## 9. 성공 지표
