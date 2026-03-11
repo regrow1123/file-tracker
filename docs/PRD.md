@@ -9,7 +9,7 @@
 | 컴포넌트 | 위치 | 역할 |
 |---------|------|------|
 | **file-tracker** (에이전트) | 각 노드 | eBPF로 파일 이벤트 감지 → Kafka 전송 |
-| **backup-consumer** (소비자) | 중앙 서버 (Lustre 마운트) | Kafka 이벤트 소비 → 변경 파일만 kopia로 백업 |
+| **backup-consumer** (소비자) | 중앙 서버 (Lustre 마운트) | Kafka 이벤트 소비 → 변경 파일만 restic으로 백업 |
 
 ## 2. 배경
 
@@ -38,10 +38,12 @@
 |------|------|
 | 입력 | Kafka 이벤트 스트림 |
 | 기능 | 변경 파일 중복 제거 → 증분 백업 실행 |
-| 백업 도구 | kopia (청크 dedup, 동시 쓰기, 스냅샷 관리) |
+| 백업 도구 | restic (청크 dedup, `--files-from`, 스냅샷 관리) |
 | 백업 스토리지 | MinIO (S3 호환 오브젝트 스토리지) |
-| 병렬 백업 | N개 worker가 단일 kopia 리포지토리에 동시 쓰기 |
-| 복원 | kopia 스냅샷에서 시점 기반 파일 복원 |
+| repo 구조 | 경로 depth 기반 분리 (depth=2: 스토리지/사용자별 repo) |
+| 병렬 백업 | repo별 독립 → 서로 다른 repo는 동시 백업 가능 |
+| 로드밸런싱 | repo 단위 태스크 큐 + worker pool |
+| 복원 | restic 스냅샷에서 시점 기반 파일 복원 |
 
 ## 4. 비목표
 
@@ -58,6 +60,7 @@
 | 커널 | 5.14+ (RHEL9), 6.12+ (RHEL10) — eBPF CO-RE, BTF 지원 |
 | 서버 규모 | 수백 대 |
 | 파일시스템 | Lustre (공유 마운트, VFS 레벨 후킹) |
+| 디렉토리 구조 | `/home/{스토리지명}/{사용자 또는 부서}/...` |
 | 백업 스토리지 | MinIO (S3 호환) |
 
 ## 6. 기능 요구사항
@@ -73,9 +76,9 @@
 ### 6.2 에이전트: 이벤트 출력
 
 ```json
-{"ts":1710000000000,"event":"delete","path":"/home/user/file.txt","hostname":"node-001"}
-{"ts":1710000000000,"event":"mtime_change","path":"/home/user/file.txt","hostname":"node-001"}
-{"ts":1710000000000,"event":"rename","old_path":"/home/user/old.txt","new_path":"/home/user/new.txt","hostname":"node-001"}
+{"ts":1710000000000,"event":"delete","path":"/home/stor1/userA/file.txt","hostname":"node-001"}
+{"ts":1710000000000,"event":"mtime_change","path":"/home/stor1/userA/file.txt","hostname":"node-001"}
+{"ts":1710000000000,"event":"rename","old_path":"/home/stor1/userA/old.txt","new_path":"/home/stor1/userA/new.txt","hostname":"node-001"}
 ```
 
 ### 6.3 에이전트: 전달
@@ -101,14 +104,17 @@
 ### 6.6 소비자: 증분 백업 실행
 
 - 주기적 (매일 새벽 등) 또는 수동 트리거
-- 변경 DB에서 변경 파일 목록 추출 → N개 worker에 분배
-- 소비자가 Lustre를 직접 마운트하므로 SSH pull 불필요
-- 각 worker가 kopia로 병렬 백업 (단일 리포지토리, 동시 쓰기)
+- 변경 DB에서 파일 목록 추출 → repo별로 그룹핑 → 태스크 큐
+- worker pool이 빈 worker부터 태스크(repo) 할당 → 자연스러운 로드밸런싱
+- 소비자가 Lustre를 직접 마운트 → SSH pull 불필요
+- 각 worker가 restic `--files-from`으로 해당 repo의 변경 파일 백업
+- 서로 다른 repo는 동시 백업 가능 (restic 락은 repo 단위)
 - 백업 완료 시 변경 DB 해당 항목 제거 + Kafka offset commit
 
 ### 6.7 소비자: 스냅샷 복원
 
-- kopia 스냅샷에서 시점 선택 → 파일/디렉토리 복원
+- restic 스냅샷에서 시점 선택 → 파일/디렉토리 복원
+- 경로에서 repo를 바로 특정 가능 (depth 규칙)
 
 ## 7. 비기능 요구사항
 
@@ -128,7 +134,7 @@
 |------|------|
 | 처리량 | 수백 노드의 이벤트를 단일 소비자로 처리 가능 |
 | 백업 신뢰성 | at-least-once (이벤트 유실 시 주기적 풀스캔 보정) |
-| 스토리지 효율 | kopia 청크 dedup으로 중복 데이터 최소화 |
+| 스토리지 효율 | restic 청크 dedup으로 중복 데이터 최소화 |
 | 복원 시간 | 단일 파일 복원 < 1분 |
 
 ## 8. 제약 및 리스크
@@ -137,9 +143,10 @@
 |--------|------|
 | 이벤트 수신~백업 사이 파일 재변경 | 다음 이벤트에서 재백업, 최종 일관성 |
 | 소비자 장기 다운 시 Kafka retention 초과 | 풀스캔 백업으로 보정 (주 1회 등) |
-| 대용량 파일 백업 시 네트워크 부하 | kopia 청크 dedup으로 변경분만 전송 |
-| MinIO 장애 | kopia 재시도, 소비자 일시 정지 |
+| 대용량 파일 백업 시 네트워크 부하 | restic 청크 dedup으로 변경분만 전송 |
+| MinIO 장애 | restic 재시도, 소비자 일시 정지 |
 | 같은 파일의 다중 노드 이벤트 | Redis 경로 기준 upsert로 중복 제거 |
+| restic repo 분리 후 병합 불가 | 초기 depth 설계 중요 |
 
 ## 9. 성공 지표
 
@@ -147,4 +154,4 @@
 - 에이전트 노드당 CPU < 1%
 - 증분 백업 시간: 풀스캔 대비 90% 이상 단축
 - 시점 복원: 임의 시점의 파일 복원 가능
-- 스토리지 효율: kopia dedup으로 원본 대비 50% 이상 절감
+- 스토리지 효율: restic dedup으로 원본 대비 50% 이상 절감

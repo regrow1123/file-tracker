@@ -35,17 +35,19 @@
 │  │  백업 트리거 (cron/수동)                            │    │
 │  │       │                                           │    │
 │  │       ▼                                           │    │
-│  │  Redis에서 변경 목록 → N worker 분배               │    │
+│  │  Redis → repo별 그룹핑 → 태스크 큐                 │    │
 │  │       │                                           │    │
 │  │       ▼                                           │    │
-│  │  kopia snapshot (병렬) → MinIO (S3)               │    │
+│  │  Worker Pool (N개)                                │    │
+│  │   각 worker: restic --files-from → MinIO          │    │
+│  │   서로 다른 repo는 동시 실행                        │    │
 │  │       │                                           │    │
 │  │  Redis 정리 + Kafka offset commit                 │    │
 │  └──────────────────────────────────────────────────┘    │
 │                                                          │
 │  ┌──────────────────┐                                    │
-│  │  MinIO (S3)      │ ← 단일 kopia 리포지토리            │
-│  │  청크 dedup      │ ← 시점별 스냅샷                    │
+│  │  MinIO (S3)      │ ← 단일 버킷, prefix별 restic repo  │
+│  │  청크 dedup      │                                    │
 │  └──────────────────┘                                    │
 └──────────────────────────────────────────────────────────┘
 ```
@@ -145,9 +147,62 @@ Ring Buffer Poll (100ms)
 
 - **Lustre 공유 마운트**: 모든 노드와 소비자가 동일한 `/home`을 공유
 - 동일 파일에 대해 여러 노드에서 이벤트 발생 가능 → **경로 기준** 중복 제거
-- 소비자가 Lustre를 직접 마운트 → SSH pull 불필요, 로컬 파일 접근
+- 소비자가 Lustre를 직접 마운트 → SSH pull 불필요
+- 디렉토리 구조: `/home/{스토리지명}/{사용자 또는 부서}/...`
 
-### 4.2 컴포넌트
+### 4.2 repo 분리 전략
+
+경로의 depth 기준으로 restic repo를 자동 분리:
+
+```python
+def get_repo_id(path, base="/home", depth=2):
+    rel = path.removeprefix(base + "/")   # "stor1/userA/docs/a.txt"
+    parts = rel.split("/")
+    return "/".join(parts[:depth])         # "stor1/userA"
+```
+
+**예시 (depth=2):**
+
+```
+/home/stor1/userA/docs/a.txt  → repo: stor1/userA
+/home/stor1/userB/data/b.txt  → repo: stor1/userB
+/home/stor2/deptC/proj/c.txt  → repo: stor2/deptC
+```
+
+**MinIO 구조:**
+
+```
+s3://file-tracker-backup/
+  stor1/userA/config        ← restic repo
+  stor1/userA/data/...
+  stor1/userA/snapshots/...
+  stor1/userB/config        ← restic repo
+  stor1/userB/data/...
+  stor2/deptC/config        ← restic repo
+  ...
+```
+
+단일 버킷, prefix로 repo 분리. repo 수 제한 없음.
+
+### 4.3 repo 자동 초기화
+
+첫 이벤트 시 해당 repo가 없으면 자동 생성:
+
+```python
+initialized_repos = set()  # 메모리 캐시
+
+def ensure_repo(repo_id):
+    if repo_id in initialized_repos:
+        return
+    repo_url = f"s3:http://minio:9000/file-tracker-backup/{repo_id}"
+    result = subprocess.run(["restic", "cat", "config", "-r", repo_url],
+                            capture_output=True)
+    if result.returncode != 0:
+        subprocess.run(["restic", "init", "-r", repo_url])
+    initialized_repos.add(repo_id)
+```
+
+### 4.4 컴포넌트
 
 ```
 ┌──────────────────────────────────────────────────────┐
@@ -156,48 +211,47 @@ Ring Buffer Poll (100ms)
 │  ┌─────────────┐   ┌──────────────────────────────┐  │
 │  │ Kafka       │──▶│ Event Processor               │  │
 │  │ Consumer    │   │ - 이벤트 파싱                   │  │
-│  └─────────────┘   │ - 경로 기준 Redis upsert       │  │
+│  └─────────────┘   │ - 경로 기준 Redis HSET         │  │
 │                     │ - hostname 무시 (Lustre 공유)   │  │
 │                     └──────────────────────────────┘  │
 │                                                       │
 │  ┌──────────────────────────────────────────────────┐ │
 │  │ Backup Scheduler                                  │ │
-│  │ - cron 또는 수동 트리거                             │ │
-│  │ - Redis에서 변경 파일 목록 추출                      │ │
-│  │ - N개 worker에 배치 분배                           │ │
-│  │ - 각 worker: staging dir → kopia snapshot (병렬)   │ │
-│  │ - 완료 시 Redis 정리 + Kafka offset commit        │ │
+│  │ 1. HGETALL pending → 전체 변경 파일 목록           │ │
+│  │ 2. repo별 그룹핑 (get_repo_id)                    │ │
+│  │ 3. repo별 태스크 → ThreadPoolExecutor              │ │
+│  │ 4. 빈 worker가 다음 repo 태스크를 가져감           │ │
+│  │ 5. 완료 시 HDEL + Kafka offset commit             │ │
 │  └──────────────────────────────────────────────────┘ │
 │                                                       │
 │  ┌────────────────┐  ┌──────────┐                    │
-│  │ Backup Workers │  │  Redis   │                    │
-│  │ (N개, 병렬)    │  │ 변경 DB  │                    │
+│  │ Worker Pool    │  │  Redis   │                    │
+│  │ (N개 스레드)   │  │ pending  │                    │
 │  └───────┬────────┘  └──────────┘                    │
 │          │                                            │
 │          ▼                                            │
-│  ┌────────────────┐                                   │
-│  │ kopia repo     │→ MinIO (S3)                       │
-│  │ (단일, 공유)   │   동시 쓰기 지원                    │
-│  └────────────────┘                                   │
+│  ┌──────────────────────────────────────────┐        │
+│  │ MinIO (S3)                                │        │
+│  │ s3://file-tracker-backup/{repo_id}/       │        │
+│  │ - repo별 독립 restic 리포지토리             │        │
+│  └──────────────────────────────────────────┘        │
 └──────────────────────────────────────────────────────┘
 ```
 
-### 4.3 변경 DB (Redis)
-
-**Hash 하나로 관리:**
+### 4.5 변경 DB (Redis)
 
 ```
-HSET pending "/home/user/a.txt" '{"event":"mtime_change","ts":1710000000}'
-HSET pending "/home/user/b.txt" '{"event":"delete","ts":1710000100}'
-HSET pending "/home/user/c.txt" '{"event":"rename","old_path":"/home/user/old.txt","ts":1710000200}'
+HSET pending "/home/stor1/userA/docs/a.txt" '{"event":"mtime_change","ts":1710000000}'
+HSET pending "/home/stor1/userA/data/b.txt" '{"event":"delete","ts":1710000100}'
+HSET pending "/home/stor2/deptC/proj/c.txt" '{"event":"rename","old_path":"...","ts":1710000200}'
 ```
 
 - `HSET`: 같은 경로면 덮어쓰기 (upsert, 중복 제거)
 - `HLEN pending`: 대기 건수
-- `HGETALL pending`: 전체 조회 (배치 분배 시)
+- `HGETALL pending`: 전체 조회 → repo별 그룹핑
 - `HDEL pending <path>`: 백업 완료 후 제거
 
-### 4.4 이벤트 처리 규칙
+### 4.6 이벤트 처리 규칙
 
 | Kafka 이벤트 | Redis 동작 |
 |-------------|-----------|
@@ -205,101 +259,107 @@ HSET pending "/home/user/c.txt" '{"event":"rename","old_path":"/home/user/old.tx
 | `delete` path=A | `HSET pending A '{"event":"delete"}'` |
 | `rename` old=A new=B | `HDEL pending A` + `HSET pending B '{"event":"rename","old_path":"A"}'` |
 
-### 4.5 백업 실행 흐름 (병렬)
+### 4.7 백업 실행 흐름
 
-kopia는 `--file-list` 옵션이 없다. 디렉토리를 스냅샷하는 방식이므로 **staging directory**를 사용:
+```python
+def run_backup():
+    # 1. Redis에서 전체 변경 파일 추출
+    all_items = redis.hgetall("pending")
+
+    # 2. repo별 그룹핑
+    tasks = {}  # {repo_id: {path: info, ...}}
+    for path, info in all_items.items():
+        repo_id = get_repo_id(path)
+        tasks.setdefault(repo_id, {})[path] = info
+
+    # 3. Worker pool이 repo 태스크를 처리 (로드밸런싱)
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futures = {
+            pool.submit(backup_repo, repo_id, files): repo_id
+            for repo_id, files in tasks.items()
+        }
+        for future in as_completed(futures):
+            future.result()  # 에러 처리
+
+    # 4. Kafka offset commit
+    consumer.commit()
+
+def backup_repo(repo_id, files):
+    ensure_repo(repo_id)
+    repo_url = f"s3:http://minio:9000/file-tracker-backup/{repo_id}"
+
+    # mtime_change + rename만 백업 (delete는 파일이 없으므로 제외)
+    backup_list = [p for p, info in files.items()
+                   if json.loads(info)["event"] != "delete"]
+
+    if backup_list:
+        # 파일 목록을 임시 파일에 작성
+        list_file = f"/tmp/restic-{repo_id.replace('/', '-')}.txt"
+        with open(list_file, "w") as f:
+            f.write("\n".join(backup_list))
+
+        subprocess.run([
+            "restic", "backup",
+            "--files-from", list_file,
+            "-r", repo_url,
+            "--tag", "incremental"
+        ], check=True)
+        os.unlink(list_file)
+
+    # Redis에서 처리된 항목 제거
+    for path in files:
+        redis.hdel("pending", path)
+```
+
+**로드밸런싱 동작:**
 
 ```
-1. 백업 트리거 (cron 또는 수동)
-2. Redis에서 변경 파일 목록 추출:
-   - HGETALL pending → 전체 {path: info} 맵
-   - N건을 W개 worker에 균등 분배
-3. 각 worker 병렬 실행:
-   a. staging dir 생성 (/tmp/backup-staging-{worker_id}/)
-   b. 변경 파일의 디렉토리 구조를 staging에 재현 (symlink):
-      ln -s /home/user/a.txt /tmp/backup-staging-0/home/user/a.txt
-   c. kopia snapshot create /tmp/backup-staging-{worker_id} \
-        --tags type:incremental,worker:{worker_id}
-   d. staging dir 삭제
-   e. 처리된 항목 HDEL pending <path>
-4. 모든 worker 완료
-5. Kafka offset commit
+tasks: {
+    "stor1/userA": 10건,
+    "stor1/userB": 5건,
+    "stor2/bigDept": 3000건,
+    "stor2/userC": 2건,
+}
+
+Worker 0 → stor1/userA (10건) → 완료 → stor2/userC (2건) → 완료 → 대기
+Worker 1 → stor1/userB (5건) → 완료 → 대기
+Worker 2 → stor2/bigDept (3000건) → ... 처리 중 ...
 ```
 
-**symlink 사용 이유:**
-- Lustre와 로컬 /tmp은 다른 파일시스템 → hardlink 불가
-- symlink는 kopia가 기본적으로 따라감 (follow symlinks)
-- 실제 데이터 복사 없음 → 빠름
+작은 repo를 먼저 끝낸 worker가 놀지 않고 다음 태스크를 가져감.
 
-**delete 이벤트 처리:**
-- 삭제된 파일은 Lustre에 이미 없으므로 백업 불가
-- 이전 스냅샷에 해당 파일이 보존되어 있음 → 복원 가능
-- delete 이벤트는 Redis에서 기록만 하고 staging에 포함하지 않음
-
-### 4.6 kopia 리포지토리
-
-단일 리포지토리, 동시 쓰기 지원:
+### 4.8 스냅샷 관리
 
 ```bash
-# 리포지토리 생성 (최초 1회)
-kopia repository create s3 \
-  --bucket file-tracker-backup \
-  --endpoint minio:9000 \
-  --disable-tls \
-  --access-key minioadmin \
-  --secret-access-key minioadmin
+# 특정 사용자의 스냅샷 목록
+restic snapshots -r s3:http://minio:9000/file-tracker-backup/stor1/userA
 
-# 리포지토리 연결 (각 worker 노드에서)
-kopia repository connect s3 \
-  --bucket file-tracker-backup \
-  --endpoint minio:9000 \
-  --disable-tls
-
-# 증분 백업 (worker별 병렬 실행 가능)
-kopia snapshot create /tmp/backup-staging-0 \
-  --tags type:incremental,worker:0
-
-# kopia는 content-addressed storage:
-# 같은 데이터는 한 번만 저장 (cross-snapshot dedup)
-```
-
-```
-MinIO:
-  s3://file-tracker-backup/    ← 단일 kopia 리포지토리
-    /kopia.repository          ← 리포지토리 메타
-    /p.../                     ← 청크 데이터 (content-addressed)
-    /q.../                     ← 인덱스
-```
-
-### 4.7 스냅샷 관리
-
-```bash
-# 스냅샷 목록
-kopia snapshot list --all
-
-# 특정 태그의 스냅샷만
-kopia snapshot list --tags type:incremental
-
-# 시점 복원 (전체)
-kopia restore <snapshot-id> /restore/
-
-# 특정 파일만 복원
-kopia restore <snapshot-id>/home/user/file.txt /restore/file.txt
+# 시점 복원
+restic restore <snapshot-id> \
+  --target /restore \
+  --include /home/stor1/userA/docs/a.txt \
+  -r s3:http://minio:9000/file-tracker-backup/stor1/userA
 
 # 오래된 스냅샷 정리 (90일 보존)
-kopia policy set --global --keep-daily 90
-kopia snapshot expire
-kopia maintenance run --full
+restic forget --keep-within 90d --prune \
+  -r s3:http://minio:9000/file-tracker-backup/stor1/userA
 ```
 
-### 4.8 풀스캔 보정
+경로에서 repo를 바로 특정:
+```
+"/home/stor1/userA/docs/a.txt" 복원
+→ depth=2 → repo = "stor1/userA"
+→ restic -r s3://.../stor1/userA
+```
+
+### 4.9 풀스캔 보정
 
 이벤트 유실 대비 주기적 풀스캔:
 
 ```
 매주 일요일 새벽:
   1. Lustre에서 find /home -type f -newer <last_fullscan_marker> 실행
-  2. 결과를 Redis pending_files에 추가
+  2. 결과를 Redis pending에 추가
   3. 정상 백업 흐름으로 처리
 ```
 
@@ -307,30 +367,25 @@ kopia maintenance run --full
 
 ### 5.1 소비자 언어: Python
 
-I/O 바운드 (Kafka read + kopia 호출). CPU 집약 아님. confluent-kafka-python + redis-py.
+I/O 바운드 (Kafka read + restic 호출). CPU 집약 아님. confluent-kafka-python + redis-py.
 
-### 5.2 백업 도구: kopia
+### 5.2 백업 도구: restic
 
-| 비교 | restic | kopia |
-|------|--------|-------|
-| 동시 쓰기 | 불가 (리포지토리 락) | **가능** |
-| S3 지원 | O | O |
-| 청크 dedup | O | O |
-| 병렬 처리 | 제한적 | 강력 (멀티스레드) |
-| 파일 목록 백업 | `--files-from` | staging dir 필요 |
-| 라이선스 | BSD 2-Clause | Apache 2.0 |
+| 항목 | restic |
+|------|--------|
+| `--files-from` | 네이티브 지원 |
+| S3 지원 | O |
+| 청크 dedup | O (content-defined chunking) |
+| 동시 쓰기 | 같은 repo 불가, 다른 repo 가능 |
+| 라이선스 | BSD 2-Clause (상업 무료) |
 
-Lustre 공유 환경에서 다수 worker 병렬 백업 → kopia.
-restic은 `--files-from`이 편리하지만 동시 쓰기 불가가 치명적.
+repo를 depth 기반으로 분리하여 동시 쓰기 문제 해결. `--files-from`으로 변경 파일만 깔끔하게 백업.
 
 ### 5.3 변경 DB: Redis
 
-| 비교 | Redis | PostgreSQL | SQLite |
-|------|-------|-----------|--------|
-| 동시 접근 | O | O | X |
-| upsert 성능 | 최고 | 중간 | 느림 |
-| 배치 분배 (HGETALL) | O | SELECT FOR UPDATE | X |
-| 영속성 | AOF/RDB | 기본 | 기본 |
+- 단일 Hash (`pending`) 하나로 관리
+- `HSET`으로 upsert (중복 제거)
+- `HGETALL`로 전체 조회 → repo별 그룹핑
 
 ## 6. 설정
 
@@ -344,10 +399,10 @@ group_id = "backup-consumer"
 
 [backup]
 schedule = "0 3 * * *"              # 매일 새벽 3시
-kopia_binary = "/usr/bin/kopia"
-workers = 10                        # 병렬 backup worker 수
-staging_dir = "/tmp/backup-staging"  # staging 기본 경로
-lustre_mount = "/home"              # Lustre 마운트 포인트
+restic_binary = "/usr/bin/restic"
+workers = 10                        # 병렬 worker 수
+base_path = "/home"                 # Lustre 마운트 포인트
+repo_depth = 2                      # repo 분리 depth
 
 [minio]
 endpoint = "minio:9000"
@@ -369,9 +424,9 @@ schedule = "0 2 * * 0"              # 매주 일요일 새벽 2시
 | Phase | 내용 | 의존성 | 예상 공수 |
 |-------|------|--------|----------|
 | **B-1** | Kafka consumer + Redis 변경 DB | Kafka, Redis | 1일 |
-| **B-2** | kopia + MinIO 연동: staging dir 방식 단일 worker 백업 | MinIO, kopia | 1일 |
-| **B-3** | 병렬 백업: N worker 동시 kopia snapshot | | 1일 |
-| **B-4** | 스케줄러: cron 백업 + 스냅샷 정리 | | 반나절 |
+| **B-2** | restic + MinIO 연동: 단일 repo 증분 백업 | MinIO, restic | 1일 |
+| **B-3** | repo 분리 + 병렬: depth 기반 repo + worker pool | | 1일 |
+| **B-4** | 스케줄러: cron 백업 + 스냅샷 정리 (forget/prune) | | 반나절 |
 | **B-5** | 풀스캔 보정: 주기적 전체 비교 + 차분 백업 | | 반나절 |
 | **B-6** | CLI: 스냅샷 조회, 파일 복원, 상태 확인 | | 1일 |
 | **B-7** | 운영: systemd, 로깅, 모니터링, 문서 | | 반나절 |
@@ -382,8 +437,8 @@ schedule = "0 2 * * 0"              # 매주 일요일 새벽 2시
 |------|------|------|
 | 이벤트~백업 사이 파일 재변경 | 중간 버전 누락 가능 | 다음 이벤트에서 재백업 (최종 일관성) |
 | Kafka retention 초과 | 이벤트 유실 | 주기적 풀스캔 보정 |
-| 대용량 파일 백업 시 네트워크 부하 | 백업 시간 증가 | kopia 청크 dedup으로 변경분만 전송 |
+| 대용량 파일 백업 시 네트워크 부하 | 백업 시간 증가 | restic 청크 dedup으로 변경분만 전송 |
 | 삭제된 파일은 Lustre에 없음 | 삭제 전 버전만 보존 | 이전 스냅샷에서 복원 가능 |
 | 같은 파일에 대한 다중 노드 이벤트 | 중복 이벤트 | Redis 경로 기준 upsert로 중복 제거 |
-| kopia에 --file-list 없음 | 개별 파일 선택 백업 불가 | staging dir + symlink로 해결 |
-| symlink 대상 파일 삭제 시 | staging에 깨진 symlink | delete 이벤트는 staging 제외 |
+| restic repo 분리 후 병합 불가 | depth 변경 시 재백업 필요 | 초기 depth 설계 중요 |
+| 같은 repo 동시 쓰기 불가 | 같은 사용자 파일은 순차 | repo 단위 태스크 분배로 해결 |
