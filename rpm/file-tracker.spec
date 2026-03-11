@@ -24,8 +24,7 @@ under /home and sends events to Apache Kafka in real-time.
 Uses CO-RE (Compile Once, Run Everywhere) for cross-kernel compatibility.
 
 %prep
-rm -rf %{_builddir}/file-tracker
-cp -a /home/vagrant/file-tracker %{_builddir}/file-tracker
+# build-rpm.sh가 이미 소스를 %{_builddir}/file-tracker에 복사함
 
 %build
 cd %{_builddir}/file-tracker
