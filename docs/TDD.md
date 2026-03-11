@@ -4,7 +4,7 @@
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  노드 (수백 대, Lustre)                                   │
+│  노드 (수백 대)                                           │
 │  ┌──────────────────────────────────────────────────┐    │
 │  │  file-tracker (에이전트)                           │    │
 │  │                                                   │    │
@@ -17,31 +17,35 @@
 │  └──────────────────────────────────────────────────┘    │
 └────────────────────────┬─────────────────────────────────┘
                          │
+              ┌──────────┴──────────┐
+              │  Lustre (/home)     │ ← 모든 노드 + 소비자 공유 마운트
+              └──────────┬──────────┘
+                         │
                     ┌────▼────┐
                     │  Kafka  │
                     └────┬────┘
                          │
 ┌────────────────────────▼─────────────────────────────────┐
-│  중앙 서버                                                │
+│  중앙 서버 (Lustre 마운트)                                 │
 │  ┌──────────────────────────────────────────────────┐    │
 │  │  backup-consumer (소비자)                          │    │
 │  │                                                   │    │
-│  │  Kafka consumer → 변경 DB (중복 제거)              │    │
+│  │  Kafka consumer → Redis (경로 기준 중복 제거)       │    │
 │  │                        │                          │    │
 │  │  백업 트리거 (cron/수동)                            │    │
 │  │       │                                           │    │
 │  │       ▼                                           │    │
-│  │  노드에서 파일 pull (SSH/rsync)                     │    │
+│  │  Redis에서 변경 목록 → N worker 분배               │    │
 │  │       │                                           │    │
 │  │       ▼                                           │    │
-│  │  restic backup → MinIO (S3)                       │    │
+│  │  kopia snapshot (병렬) → MinIO (S3)               │    │
 │  │       │                                           │    │
-│  │  offset commit + 변경 DB 정리                      │    │
+│  │  Redis 정리 + Kafka offset commit                 │    │
 │  └──────────────────────────────────────────────────┘    │
 │                                                          │
 │  ┌──────────────────┐                                    │
-│  │  MinIO (S3)      │ ← restic 리포지토리               │
-│  │  청크 dedup      │ ← 버전별 스냅샷                    │
+│  │  MinIO (S3)      │ ← 단일 kopia 리포지토리            │
+│  │  청크 dedup      │ ← 시점별 스냅샷                    │
 │  └──────────────────┘                                    │
 └──────────────────────────────────────────────────────────┘
 ```
@@ -139,9 +143,9 @@ Ring Buffer Poll (100ms)
 
 ### 4.1 환경 전제
 
-- **Lustre 공유 마운트**: 모든 노드가 동일한 `/home`을 공유
-- 동일 파일에 대해 여러 노드에서 이벤트 발생 가능 → 경로 기준 중복 제거
-- 백업 worker는 Lustre 마운트만 하면 어디서든 파일 접근 가능
+- **Lustre 공유 마운트**: 모든 노드와 소비자가 동일한 `/home`을 공유
+- 동일 파일에 대해 여러 노드에서 이벤트 발생 가능 → **경로 기준** 중복 제거
+- 소비자가 Lustre를 직접 마운트 → SSH pull 불필요, 로컬 파일 접근
 
 ### 4.2 컴포넌트
 
@@ -159,9 +163,9 @@ Ring Buffer Poll (100ms)
 │  ┌──────────────────────────────────────────────────┐ │
 │  │ Backup Scheduler                                  │ │
 │  │ - cron 또는 수동 트리거                             │ │
-│  │ - Redis에서 변경 파일 목록 추출 (SPOP N건)          │ │
+│  │ - Redis에서 변경 파일 목록 추출                      │ │
 │  │ - N개 worker에 배치 분배                           │ │
-│  │ - 각 worker: kopia snapshot (병렬, 단일 repo)      │ │
+│  │ - 각 worker: staging dir → kopia snapshot (병렬)   │ │
 │  │ - 완료 시 Redis 정리 + Kafka offset commit        │ │
 │  └──────────────────────────────────────────────────┘ │
 │                                                       │
@@ -180,45 +184,61 @@ Ring Buffer Poll (100ms)
 
 ### 4.3 변경 DB (Redis)
 
-Lustre 공유 마운트이므로 **경로만으로 유일하게 식별.** hostname은 "어느 노드에서 이벤트가 발생했는가"일 뿐, 파일 자체는 동일.
+두 가지 자료구조를 사용:
 
+**1) 이벤트 정보 (String)**
 ```
-Redis key 구조:
-
-SET  changed:<path>  <json>
-     changed:/home/user/a.txt  {"event":"mtime_change","ts":1710000000}
-     changed:/home/user/b.txt  {"event":"delete","ts":1710000100}
-     changed:/home/user/c.txt  {"event":"rename","old_path":"/home/user/old.txt","ts":1710000200}
+SET  changed:/home/user/a.txt  '{"event":"mtime_change","ts":1710000000}'
+SET  changed:/home/user/b.txt  '{"event":"delete","ts":1710000100}'
 ```
 
-- `SET`으로 upsert: 같은 경로의 이전 이벤트를 덮어씀
-- `SCAN changed:*`으로 전체 목록 조회
-- `SPOP`/`SRANDMEMBER`로 worker에 배치 분배
-- 처리 완료 시 `DEL`
+**2) 대기 목록 (Set)**
+```
+SADD pending_files "/home/user/a.txt"
+SADD pending_files "/home/user/b.txt"
+```
+
+- `changed:*`: 각 파일의 최신 이벤트 정보 (upsert)
+- `pending_files`: 백업 대기 중인 경로 집합 (SPOP으로 분배)
 
 ### 4.4 이벤트 처리 규칙
 
 | Kafka 이벤트 | Redis 동작 |
 |-------------|-----------|
-| `mtime_change` path=A | `SET changed:A {"event":"mtime_change"}` |
-| `delete` path=A | `SET changed:A {"event":"delete"}` |
-| `rename` old=A new=B | `DEL changed:A` + `SET changed:B {"event":"rename","old_path":"A"}` |
+| `mtime_change` path=A | `SET changed:A {mtime_change}` + `SADD pending_files A` |
+| `delete` path=A | `SET changed:A {delete}` + `SADD pending_files A` |
+| `rename` old=A new=B | `DEL changed:A` + `SREM pending_files A` + `SET changed:B {rename}` + `SADD pending_files B` |
 
 ### 4.5 백업 실행 흐름 (병렬)
 
+kopia는 `--file-list` 옵션이 없다. 디렉토리를 스냅샷하는 방식이므로 **staging directory**를 사용:
+
 ```
 1. 백업 트리거 (cron 또는 수동)
-2. Redis에서 변경 파일 목록 추출 → 전체 N건
-3. N건을 W개 worker에 분배 (N/W건씩)
-4. 각 worker 병렬 실행:
-   a. 파일 목록 → /tmp/backup_batch_{worker_id}.txt
-   b. kopia snapshot create \
-        --file-list /tmp/backup_batch_{worker_id}.txt \
-        --tags type:incremental
-   c. delete 이벤트 → 별도 기록 (kopia 스냅샷 이력으로 보존)
-5. 모든 worker 완료 → Redis에서 처리된 항목 DEL
-6. Kafka offset commit
+2. Redis에서 변경 파일 목록 추출:
+   - SCARD pending_files → 전체 N건
+   - SPOP pending_files <batch_size> × W회 → worker별 분배
+3. 각 worker 병렬 실행:
+   a. staging dir 생성 (/tmp/backup-staging-{worker_id}/)
+   b. 변경 파일의 디렉토리 구조를 staging에 재현 (symlink):
+      ln -s /home/user/a.txt /tmp/backup-staging-0/home/user/a.txt
+   c. kopia snapshot create /tmp/backup-staging-{worker_id} \
+        --tags type:incremental,worker:{worker_id}
+   d. staging dir 삭제
+   e. 처리된 항목의 changed:* 키 DEL
+4. 모든 worker 완료
+5. Kafka offset commit
 ```
+
+**symlink 사용 이유:**
+- Lustre와 로컬 /tmp은 다른 파일시스템 → hardlink 불가
+- symlink는 kopia가 기본적으로 따라감 (follow symlinks)
+- 실제 데이터 복사 없음 → 빠름
+
+**delete 이벤트 처리:**
+- 삭제된 파일은 Lustre에 이미 없으므로 백업 불가
+- 이전 스냅샷에 해당 파일이 보존되어 있음 → 복원 가능
+- delete 이벤트는 Redis에서 기록만 하고 staging에 포함하지 않음
 
 ### 4.6 kopia 리포지토리
 
@@ -233,17 +253,18 @@ kopia repository create s3 \
   --access-key minioadmin \
   --secret-access-key minioadmin
 
-# 리포지토리 연결 (각 worker)
+# 리포지토리 연결 (각 worker 노드에서)
 kopia repository connect s3 \
   --bucket file-tracker-backup \
   --endpoint minio:9000 \
   --disable-tls
 
 # 증분 백업 (worker별 병렬 실행 가능)
-kopia snapshot create --file-list batch.txt --tags type:incremental
+kopia snapshot create /tmp/backup-staging-0 \
+  --tags type:incremental,worker:0
 
-# 동시 쓰기: kopia는 락 없이 여러 프로세스가
-#            같은 리포지토리에 동시 스냅샷 생성 가능
+# kopia는 content-addressed storage:
+# 같은 데이터는 한 번만 저장 (cross-snapshot dedup)
 ```
 
 ```
@@ -258,19 +279,19 @@ MinIO:
 
 ```bash
 # 스냅샷 목록
-kopia snapshot list
+kopia snapshot list --all
 
-# 특정 파일이 포함된 스냅샷 검색
-kopia snapshot list --all | grep "home/user/file.txt"
+# 특정 태그의 스냅샷만
+kopia snapshot list --tags type:incremental
 
-# 시점 복원
+# 시점 복원 (전체)
 kopia restore <snapshot-id> /restore/
 
 # 특정 파일만 복원
 kopia restore <snapshot-id>/home/user/file.txt /restore/file.txt
 
 # 오래된 스냅샷 정리 (90일 보존)
-kopia policy set --global --keep-latest 0 --keep-daily 90
+kopia policy set --global --keep-daily 90
 kopia snapshot expire
 kopia maintenance run --full
 ```
@@ -281,9 +302,9 @@ kopia maintenance run --full
 
 ```
 매주 일요일 새벽:
-  1. Lustre에서 find /home -type f -newer <last_fullscan> 실행
-  2. 결과를 현재 kopia 스냅샷과 비교
-  3. 차이 있는 파일만 kopia snapshot create
+  1. Lustre에서 find /home -type f -newer <last_fullscan_marker> 실행
+  2. 결과를 Redis pending_files에 추가
+  3. 정상 백업 흐름으로 처리
 ```
 
 ## 5. 기술 선택
@@ -300,9 +321,11 @@ I/O 바운드 (Kafka read + kopia 호출). CPU 집약 아님. confluent-kafka-py
 | S3 지원 | O | O |
 | 청크 dedup | O | O |
 | 병렬 처리 | 제한적 | 강력 (멀티스레드) |
+| 파일 목록 백업 | `--files-from` | staging dir 필요 |
 | 라이선스 | BSD 2-Clause | Apache 2.0 |
 
-Lustre 공유 환경에서 다수 worker 병렬 백업 → kopia 필수.
+Lustre 공유 환경에서 다수 worker 병렬 백업 → kopia.
+restic은 `--files-from`이 편리하지만 동시 쓰기 불가가 치명적.
 
 ### 5.3 변경 DB: Redis
 
@@ -310,7 +333,7 @@ Lustre 공유 환경에서 다수 worker 병렬 백업 → kopia 필수.
 |------|-------|-----------|--------|
 | 동시 접근 | O | O | X |
 | upsert 성능 | 최고 | 중간 | 느림 |
-| 배치 분배 | SPOP | SELECT FOR UPDATE | X |
+| 배치 분배 (SPOP) | O | SELECT FOR UPDATE | X |
 | 영속성 | AOF/RDB | 기본 | 기본 |
 
 ## 6. 설정
@@ -327,6 +350,7 @@ group_id = "backup-consumer"
 schedule = "0 3 * * *"              # 매일 새벽 3시
 kopia_binary = "/usr/bin/kopia"
 workers = 10                        # 병렬 backup worker 수
+staging_dir = "/tmp/backup-staging"  # staging 기본 경로
 lustre_mount = "/home"              # Lustre 마운트 포인트
 
 [minio]
@@ -349,7 +373,7 @@ schedule = "0 2 * * 0"              # 매주 일요일 새벽 2시
 | Phase | 내용 | 의존성 | 예상 공수 |
 |-------|------|--------|----------|
 | **B-1** | Kafka consumer + Redis 변경 DB | Kafka, Redis | 1일 |
-| **B-2** | kopia + MinIO 연동: 단일 worker 증분 백업 | MinIO, kopia | 1일 |
+| **B-2** | kopia + MinIO 연동: staging dir 방식 단일 worker 백업 | MinIO, kopia | 1일 |
 | **B-3** | 병렬 백업: N worker 동시 kopia snapshot | | 1일 |
 | **B-4** | 스케줄러: cron 백업 + 스냅샷 정리 | | 반나절 |
 | **B-5** | 풀스캔 보정: 주기적 전체 비교 + 차분 백업 | | 반나절 |
@@ -365,3 +389,5 @@ schedule = "0 2 * * 0"              # 매주 일요일 새벽 2시
 | 대용량 파일 백업 시 네트워크 부하 | 백업 시간 증가 | kopia 청크 dedup으로 변경분만 전송 |
 | 삭제된 파일은 Lustre에 없음 | 삭제 전 버전만 보존 | 이전 스냅샷에서 복원 가능 |
 | 같은 파일에 대한 다중 노드 이벤트 | 중복 이벤트 | Redis 경로 기준 upsert로 중복 제거 |
+| kopia에 --file-list 없음 | 개별 파일 선택 백업 불가 | staging dir + symlink로 해결 |
+| symlink 대상 파일 삭제 시 | staging에 깨진 symlink | delete 이벤트는 staging 제외 |
