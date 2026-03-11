@@ -30,6 +30,9 @@ public:
     // Number of pending entries
     size_t pending() const;
 
+    // Hot reload: update debounce intervals
+    void set_intervals(std::chrono::milliseconds quiet, std::chrono::milliseconds max_wait);
+
 private:
     struct Entry {
         Clock::time_point first_seen;
