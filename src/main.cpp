@@ -19,14 +19,9 @@
 #include "wal.h"
 
 static volatile bool running = true;
-static volatile bool reload_requested = false;
 
 static void sig_handler(int sig) {
     running = false;
-}
-
-static void sighup_handler(int sig) {
-    reload_requested = true;
 }
 
 static std::string get_hostname() {
@@ -139,7 +134,6 @@ static uint64_t read_percpu_counter(int map_fd, uint32_t key) {
 int main(int argc, char **argv) {
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
-    signal(SIGHUP, sighup_handler);
 
     // Config
     Config cfg;
@@ -287,34 +281,10 @@ int main(int argc, char **argv) {
     // Main loop
     while (running) {
         err = ring_buffer__poll(rb, 100);
-        if (err == -EINTR && !running) break;
-        if (err < 0 && err != -EINTR) {
+        if (err == -EINTR) break;
+        if (err < 0) {
             Log::error("ring_buffer__poll error: %d", err);
             break;
-        }
-
-        // Hot reload on SIGHUP
-        if (reload_requested) {
-            reload_requested = false;
-            Config new_cfg;
-            new_cfg.load(config_path);
-
-            // Log level
-            Log::set_level_from_string(new_cfg.log_level.c_str());
-
-            // Debounce intervals
-            debouncer.set_intervals(
-                std::chrono::milliseconds(new_cfg.debounce_quiet_ms),
-                std::chrono::milliseconds(new_cfg.debounce_max_wait_ms));
-
-            // Watch prefix
-            ectx.watch_prefix = new_cfg.watch_prefix;
-
-            Log::info("Config reloaded: log=%s debounce=%lldms/%lldms watch=%s",
-                      new_cfg.log_level.c_str(),
-                      (long long)new_cfg.debounce_quiet_ms,
-                      (long long)new_cfg.debounce_max_wait_ms,
-                      new_cfg.watch_prefix.c_str());
         }
 
         debouncer.tick();

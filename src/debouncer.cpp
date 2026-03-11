@@ -87,10 +87,3 @@ size_t Debouncer::pending() const {
     std::lock_guard<std::mutex> lock(mu_);
     return entries_.size();
 }
-
-void Debouncer::set_intervals(std::chrono::milliseconds quiet,
-                              std::chrono::milliseconds max_wait) {
-    std::lock_guard<std::mutex> lock(mu_);
-    quiet_period_ = quiet;
-    max_wait_ = max_wait;
-}
