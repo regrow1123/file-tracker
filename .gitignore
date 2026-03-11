@@ -4,3 +4,4 @@ include/vmlinux.h
 *.skel.h
 compile_commands.json
 .cache/
+rpm/*.rpm
