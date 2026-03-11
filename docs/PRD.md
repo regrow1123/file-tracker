@@ -93,7 +93,7 @@
 
 - Kafka consumer group으로 이벤트 소비
 - Lustre 공유 마운트이므로 **경로 기준으로 중복 제거** (hostname 무관)
-- 변경 DB (Redis)에 경로 키로 upsert:
+- 변경 DB (Redis Hash)에 경로 키로 upsert:
   - `mtime_change` → 백업 대상
   - `delete` → 삭제 기록
   - `rename` → old_path 제거 + new_path 백업
