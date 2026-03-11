@@ -11,6 +11,11 @@ fi
 
 echo "Installing file-tracker..."
 
+# Stop any existing instances
+systemctl stop file-tracker 2>/dev/null || true
+pkill -x file-tracker 2>/dev/null || true
+sleep 1
+
 # Binary
 install -m 0755 "$BIN" /usr/local/bin/file-tracker
 
