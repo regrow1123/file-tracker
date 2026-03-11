@@ -1,0 +1,19 @@
+[Unit]
+Description=backup-consumer: Kafka event consumer + restic incremental backup
+After=network-online.target redis.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=backup
+Group=backup
+ExecStart=/usr/bin/python3 /opt/backup-consumer/main.py /etc/backup-consumer/config.toml
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=backup-consumer
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target
