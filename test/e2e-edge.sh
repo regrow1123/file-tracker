@@ -10,6 +10,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONSUMER_DIR="$PROJECT_DIR/consumer"
+BACKUP_DIR="$PROJECT_DIR/backup"
 BINARY="$PROJECT_DIR/build/file-tracker"
 
 TEST_HOME="/home/e2e-edge"
@@ -93,7 +94,7 @@ cd "$CONSUMER_DIR"
 info "EDGE-1" "빈 pending으로 backup"
 
 redis-cli FLUSHALL > /dev/null
-python3 backup.py "$CONSUMER_CONFIG" > /tmp/e2e-edge1.log 2>&1
+python3 "$BACKUP_DIR/backup.py" "$CONSUMER_CONFIG" > /tmp/e2e-edge1.log 2>&1
 RC=$?
 
 if [[ $RC -eq 0 ]]; then
@@ -117,7 +118,7 @@ redis-cli FLUSHALL > /dev/null
 redis-cli HSET pending "$TEST_DIR/nonexist1.txt" "mtime_change" > /dev/null
 redis-cli HSET pending "$TEST_DIR/nonexist2.txt" "mtime_change" > /dev/null
 
-python3 backup.py "$CONSUMER_CONFIG" > /tmp/e2e-edge2.log 2>&1
+python3 "$BACKUP_DIR/backup.py" "$CONSUMER_CONFIG" > /tmp/e2e-edge2.log 2>&1
 
 LAST_SKIPPED=$(redis-cli HGET backup:last_run skipped)
 LAST_BACKED=$(redis-cli HGET backup:last_run backed_up)
@@ -139,7 +140,7 @@ redis-cli HSET pending "$TEST_DIR/locktest.txt" "mtime_change" > /dev/null
 # 락 선점
 redis-cli SET backup:lock "other-node-test" EX 60 NX > /dev/null
 
-python3 backup.py "$CONSUMER_CONFIG" > /tmp/e2e-edge3.log 2>&1
+python3 "$BACKUP_DIR/backup.py" "$CONSUMER_CONFIG" > /tmp/e2e-edge3.log 2>&1
 
 if grep -q "다른 노드에서 백업 실행 중: other-node-test" /tmp/e2e-edge3.log; then
     pass "분산 락 충돌 감지"
@@ -169,7 +170,7 @@ redis-cli FLUSHALL > /dev/null
 echo "recovery test" > "$TEST_DIR/recover.txt"
 redis-cli HSET processing "$TEST_DIR/recover.txt" "mtime_change" > /dev/null
 
-python3 backup.py "$CONSUMER_CONFIG" > /tmp/e2e-edge4.log 2>&1
+python3 "$BACKUP_DIR/backup.py" "$CONSUMER_CONFIG" > /tmp/e2e-edge4.log 2>&1
 
 if grep -q "이전 processing 키 발견" /tmp/e2e-edge4.log; then
     pass "processing 복구 감지"

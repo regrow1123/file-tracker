@@ -9,6 +9,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONSUMER_DIR="$PROJECT_DIR/consumer"
+BACKUP_DIR="$PROJECT_DIR/backup"
 BINARY="$PROJECT_DIR/build/file-tracker"
 
 # 테스트 디렉토리 (watch prefix = /home)
@@ -261,7 +262,7 @@ fi
 # ═══════════════════════════════════════════════════════════════
 info "BACKUP" "backup 실행"
 
-python3 backup.py "$CONSUMER_CONFIG" > /tmp/e2e-backup.log 2>&1
+python3 "$BACKUP_DIR/backup.py" "$CONSUMER_CONFIG" > /tmp/e2e-backup.log 2>&1
 BACKUP_RC=$?
 
 if [[ $BACKUP_RC -eq 0 ]]; then
@@ -309,7 +310,7 @@ fi
 info "RESTORE" "파일 복원 테스트"
 
 rm -rf /tmp/e2e-restore
-python3 cli.py -c "$CONSUMER_CONFIG" restore "$TEST_DIR/file1.txt" \
+python3 "$BACKUP_DIR/cli.py" -c "$CONSUMER_CONFIG" restore "$TEST_DIR/file1.txt" \
     -t /tmp/e2e-restore > /tmp/e2e-restore.log 2>&1
 RESTORE_RC=$?
 
@@ -337,7 +338,7 @@ fi
 # ═══════════════════════════════════════════════════════════════
 info "PRUNE" "prune 실행"
 
-python3 prune.py "$CONSUMER_CONFIG" > /tmp/e2e-prune.log 2>&1
+python3 "$BACKUP_DIR/prune.py" "$CONSUMER_CONFIG" > /tmp/e2e-prune.log 2>&1
 PRUNE_RC=$?
 
 if [[ $PRUNE_RC -eq 0 ]]; then

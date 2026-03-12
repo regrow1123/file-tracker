@@ -28,18 +28,6 @@ EVENTS_REDIS_ERRORS = Counter(
 PENDING_TOTAL = Gauge(
     "backup_pending_total",
     "Current number of files in Redis pending")
-BACKUP_LAST_TIMESTAMP = Gauge(
-    "backup_last_run_timestamp",
-    "Unix timestamp of last backup run")
-BACKUP_LAST_BACKED_UP = Gauge(
-    "backup_last_run_backed_up",
-    "Files backed up in last run")
-BACKUP_LAST_ERRORS = Gauge(
-    "backup_last_run_errors",
-    "Errors in last backup run")
-BACKUP_LAST_DURATION = Gauge(
-    "backup_last_run_duration_seconds",
-    "Duration of last backup run in seconds")
 
 
 class EventProcessor:
@@ -134,11 +122,5 @@ class EventProcessor:
         """Prometheus gauge 갱신."""
         try:
             PENDING_TOTAL.set(self.r.hlen("pending"))
-            last_run = self.r.hgetall("backup:last_run")
-            if last_run:
-                BACKUP_LAST_TIMESTAMP.set(float(last_run.get("timestamp", 0)))
-                BACKUP_LAST_BACKED_UP.set(float(last_run.get("backed_up", 0)))
-                BACKUP_LAST_ERRORS.set(float(last_run.get("errors", 0)))
-                BACKUP_LAST_DURATION.set(float(last_run.get("duration", 0)))
         except redis.exceptions.RedisError:
             pass  # metrics 갱신 실패는 무시

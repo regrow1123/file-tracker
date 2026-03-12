@@ -1,0 +1,24 @@
+[kafka]
+brokers = "localhost:9092"
+topic = "file-tracker-events"
+group_id = "backup-consumer"
+
+[backup]
+restic_binary = "/usr/bin/restic"
+workers = 4
+base_path = "/home"
+repo_depth = 2
+
+[minio]
+endpoint = "localhost:9000"
+bucket = "file-tracker-backup"
+use_tls = false
+
+[db]
+redis_url = "redis://localhost:6379/0"
+
+[prune]
+keep_days = 90
+
+[logging]
+level = "INFO"
