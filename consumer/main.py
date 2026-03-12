@@ -62,10 +62,19 @@ def main():
     signal.signal(signal.SIGINT, sig_handler)
     signal.signal(signal.SIGTERM, sig_handler)
 
+    import time
     last_log_count = 0
+    last_metrics_time = time.time()
     try:
         while running:
             msg = kafka_consumer.poll(1.0)
+
+            # 10초마다 gauge 갱신 (이벤트 유무와 무관)
+            now = time.time()
+            if now - last_metrics_time >= 10:
+                processor.update_metrics()
+                last_metrics_time = now
+
             if msg is None:
                 continue
             if msg.error():
@@ -78,6 +87,8 @@ def main():
 
             if processor.stats["processed"] - last_log_count >= 1000:
                 last_log_count = processor.stats["processed"]
+                processor.update_metrics()
+                last_metrics_time = time.time()
                 pending = r.hlen("pending")
                 log.info("이벤트: %d건, 삭제스킵: %d, pending: %d",
                          processor.stats["processed"],

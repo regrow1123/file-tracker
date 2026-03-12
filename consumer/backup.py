@@ -46,26 +46,37 @@ class RepoManager:
         with self._lock:
             if repo_url in self._initialized:
                 return True
+            # repo별 lock: 같은 repo의 중복 init 방지
+            if not hasattr(self, '_pending'):
+                self._pending = set()
+            if repo_url in self._pending:
+                # 다른 스레드가 init 중 → 완료 대기
+                pass
+            self._pending.add(repo_url)
 
         # lock 밖에서 restic 호출 (I/O 블로킹)
-        result = subprocess.run(
-            [self._restic, "cat", "config", "-r", repo_url],
-            capture_output=True, env=env
-        )
-        if result.returncode != 0:
-            log.info("repo 초기화: %s", repo_url)
+        try:
             result = subprocess.run(
-                [self._restic, "init", "-r", repo_url],
+                [self._restic, "cat", "config", "-r", repo_url],
                 capture_output=True, env=env
             )
             if result.returncode != 0:
-                log.error("repo init 실패: %s: %s",
-                          repo_url, result.stderr.decode())
-                return False
+                log.info("repo 초기화: %s", repo_url)
+                result = subprocess.run(
+                    [self._restic, "init", "-r", repo_url],
+                    capture_output=True, env=env
+                )
+                if result.returncode != 0:
+                    log.error("repo init 실패: %s: %s",
+                              repo_url, result.stderr.decode())
+                    return False
 
-        with self._lock:
-            self._initialized.add(repo_url)
-        return True
+            with self._lock:
+                self._initialized.add(repo_url)
+            return True
+        finally:
+            with self._lock:
+                self._pending.discard(repo_url)
 
 
 def backup_repo(repo_id: str, paths: list[str], cfg: dict, env: dict,
@@ -223,10 +234,9 @@ def run_backup(cfg: dict, r: redis.Redis):
     r.delete("processing")
 
     # 8. 백업 결과를 Redis에 기록 (Prometheus exporter용)
-    import time as _time
-    duration = _time.time() - start_time
+    duration = time.time() - start_time
     r.hset("backup:last_run", mapping={
-        "timestamp": str(int(_time.time())),
+        "timestamp": str(int(time.time())),
         "backed_up": str(total["backed_up"]),
         "skipped": str(total["skipped"]),
         "errors": str(total["errors"]),

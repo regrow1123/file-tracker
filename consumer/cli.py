@@ -34,7 +34,9 @@ def restic_bin(cfg):
 def repo_url(cfg, repo_id):
     endpoint = cfg["minio"]["endpoint"]
     bucket = cfg["minio"]["bucket"]
-    return f"s3:http://{endpoint}/{bucket}/{repo_id}"
+    use_tls = cfg["minio"].get("use_tls", False)
+    scheme = "https" if use_tls else "http"
+    return f"s3:{scheme}://{endpoint}/{bucket}/{repo_id}"
 
 
 def get_repo_id(path, base, depth):
@@ -82,10 +84,8 @@ def cmd_status(args):
     if args.verbose and pending > 0:
         all_items = r.hgetall("pending")
         by_event = {}
-        for _, info_str in all_items.items():
-            info = json.loads(info_str)
-            ev = info.get("event", "unknown")
-            by_event[ev] = by_event.get(ev, 0) + 1
+        for _, event_type in all_items.items():
+            by_event[event_type] = by_event.get(event_type, 0) + 1
         for ev, count in sorted(by_event.items()):
             print(f"  {ev}: {count}")
 
