@@ -130,22 +130,27 @@ def run_backup(cfg: dict, r: redis.Redis):
 
     # 이 시점부터 consumer는 새 pending에 쓰기 (HSET이 자동 생성)
 
-    # 2. processing에서 전체 추출
-    all_items = r.hgetall("processing")
-    log.info("총 %d건 processing", len(all_items))
-
-    # 3. repo별 그룹핑
+    # 2. processing에서 HSCAN으로 배치 추출 (Redis 블로킹 방지)
     base = cfg["backup"]["base_path"]
     depth = cfg["backup"]["repo_depth"]
     tasks = {}  # {repo_id: [path, ...]}
     skipped = 0
+    total_count = 0
 
-    for path in all_items:
-        repo_id = get_repo_id(path, base, depth)
-        if repo_id is None:
-            skipped += 1
-            continue
-        tasks.setdefault(repo_id, []).append(path)
+    cursor = 0
+    while True:
+        cursor, items = r.hscan("processing", cursor, count=10000)
+        for path in items:
+            total_count += 1
+            repo_id = get_repo_id(path, base, depth)
+            if repo_id is None:
+                skipped += 1
+                continue
+            tasks.setdefault(repo_id, []).append(path)
+        if cursor == 0:
+            break
+
+    log.info("총 %d건 processing", total_count)
 
     if skipped:
         log.warning("repo 매핑 실패 (depth 부족): %d건", skipped)
