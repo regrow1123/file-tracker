@@ -3,7 +3,7 @@ SPEC         := $(PROJECT_DIR)/rpm/file-tracker.spec
 RDKAFKA_VER  := 2.3.0
 NPROC        := $(shell nproc)
 
-.PHONY: all build rpm deps deps-rdkafka clean install uninstall
+.PHONY: all build rpm rpm-consumer deps deps-rdkafka clean install uninstall
 
 all: build
 
@@ -51,6 +51,13 @@ rpm: build
 	@echo ""
 	@echo "=== RPM ==="
 	@find ~/rpmbuild/RPMS -name "file-tracker-*.rpm" -type f
+
+# --- Consumer RPM ---
+rpm-consumer:
+	bash $(PROJECT_DIR)/consumer/rpm/build-rpm.sh
+	@echo ""
+	@echo "=== Consumer RPM ==="
+	@find ~/rpmbuild/RPMS -name "backup-consumer-*.rpm" -type f
 
 # --- 로컬 설치/제거 (RPM 없이) ---
 install: build

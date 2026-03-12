@@ -68,26 +68,38 @@ eBPF 기반 실시간 파일 변경/삭제/이름변경 추적 에이전트.
 make deps              # RHEL 패키지 (clang, libbpf-devel, bpftool 등)
 make deps-rdkafka      # librdkafka 2.3.0 소스 빌드
 
-# 빌드
+# 에이전트 빌드
 make build
 
 # RPM 패키징
-make rpm
-# → ~/rpmbuild/RPMS/x86_64/file-tracker-1.0.0-1.el9.x86_64.rpm
+make rpm               # 에이전트 RPM
+make rpm-consumer      # consumer RPM
 ```
 
 ## 설치
 
-### RPM
+### 에이전트 (각 노드)
 
 ```bash
+# RPM
 sudo rpm -ivh file-tracker-1.0.0-1.el9.x86_64.rpm
+sudo vi /etc/file-tracker/config.toml
+sudo systemctl enable --now file-tracker
+
+# 또는 수동
+make install
 ```
 
-### 수동
+### Consumer (중앙 서버)
 
 ```bash
-make install
+# RPM
+sudo rpm -ivh backup-consumer-1.0.0-1.noarch.rpm
+sudo vi /etc/backup-consumer/config.toml
+sudo systemctl enable --now backup-consumer
+
+# 또는 수동
+cd consumer && sudo bash deploy/install.sh
 ```
 
 ## 설정
@@ -245,15 +257,27 @@ sudo vi /etc/file-tracker/config.toml   # brokers 주소만 변경
 sudo systemctl enable --now file-tracker
 ```
 
-### 증분 백업 시스템
+### Consumer 배포
 
-별도의 `backup-consumer` 컴포넌트가 Kafka 이벤트를 소비하여 restic으로 백업:
+consumer는 `noarch` RPM이므로 아키텍처 무관:
 
-```
-file-tracker (각 노드) → Kafka → backup-consumer → restic → MinIO
+```bash
+# RPM 배포
+sudo rpm -ivh backup-consumer-1.0.0-1.noarch.rpm
+
+# config: Kafka brokers, Redis URL 설정
+sudo vi /etc/backup-consumer/config.toml
+
+# Prometheus 메트릭 확인
+curl http://localhost:9101/metrics
 ```
 
 자세한 내용은 [`consumer/README.md`](consumer/README.md) 참조.
+
+### 백업 시스템 연동
+
+consumer가 생성하는 Redis `pending` Hash를 소비하는 백업 시스템은 별도 구성.
+참조 구현: [`backup/`](backup/) 디렉토리.
 
 ## 테스트
 
