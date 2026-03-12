@@ -8,6 +8,7 @@ import signal
 import sys
 import logging
 from confluent_kafka import Consumer, KafkaError
+from prometheus_client import start_http_server
 import redis
 import toml
 
@@ -28,6 +29,11 @@ def main():
     r = redis.Redis.from_url(cfg["db"]["redis_url"], decode_responses=True)
     r.ping()
     log.info("Redis OK, pending: %d건", r.hlen("pending"))
+
+    # Prometheus 메트릭 서버
+    metrics_port = cfg.get("metrics", {}).get("port", 9101)
+    start_http_server(metrics_port)
+    log.info("Prometheus 메트릭: http://0.0.0.0:%d/metrics", metrics_port)
 
     kafka_consumer = Consumer({
         "bootstrap.servers": cfg["kafka"]["brokers"],

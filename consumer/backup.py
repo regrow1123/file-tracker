@@ -132,6 +132,8 @@ def backup_repo(repo_id: str, paths: list[str], cfg: dict, env: dict,
 def run_backup(cfg: dict, r: redis.Redis):
     """전체 백업: RENAME으로 pending 스냅샷 → repo별 병렬 restic backup."""
 
+    start_time = time.time()
+
     # 1. 원자적 swap: pending → processing
     try:
         r.rename("pending", "processing")
@@ -220,8 +222,20 @@ def run_backup(cfg: dict, r: redis.Redis):
     # 7. processing 삭제
     r.delete("processing")
 
-    log.info("백업 완료. 백업: %d, 스킵: %d, 에러: %d",
-             total["backed_up"], total["skipped"], total["errors"])
+    # 8. 백업 결과를 Redis에 기록 (Prometheus exporter용)
+    import time as _time
+    duration = _time.time() - start_time
+    r.hset("backup:last_run", mapping={
+        "timestamp": str(int(_time.time())),
+        "backed_up": str(total["backed_up"]),
+        "skipped": str(total["skipped"]),
+        "errors": str(total["errors"]),
+        "repos": str(len(tasks)),
+        "duration": f"{duration:.1f}",
+    })
+
+    log.info("백업 완료. 백업: %d, 스킵: %d, 에러: %d, 소요: %.1fs",
+             total["backed_up"], total["skipped"], total["errors"], duration)
 
 
 def main():

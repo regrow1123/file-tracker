@@ -19,3 +19,6 @@ redis_url = "redis://localhost:6379/0"
 
 [prune]
 keep_days = 90
+
+[metrics]
+port = 9101
