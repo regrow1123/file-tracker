@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from minio import Minio
 import redis
 import toml
 
@@ -17,9 +18,12 @@ def load_config(args):
 
 def restic_env(cfg):
     env = os.environ.copy()
-    env["RESTIC_PASSWORD"] = cfg["backup"]["restic_password"]
-    env["AWS_ACCESS_KEY_ID"] = cfg["minio"]["access_key"]
-    env["AWS_SECRET_ACCESS_KEY"] = cfg["minio"]["secret_key"]
+    if "RESTIC_PASSWORD" not in env:
+        env["RESTIC_PASSWORD"] = cfg["backup"].get("restic_password", "")
+    if "AWS_ACCESS_KEY_ID" not in env:
+        env["AWS_ACCESS_KEY_ID"] = cfg["minio"].get("access_key", "")
+    if "AWS_SECRET_ACCESS_KEY" not in env:
+        env["AWS_SECRET_ACCESS_KEY"] = cfg["minio"].get("secret_key", "")
     return env
 
 
@@ -41,20 +45,22 @@ def get_repo_id(path, base, depth):
 
 def list_repos(cfg, env):
     """MinIO에서 restic repo 목록 조회."""
+    endpoint = cfg["minio"]["endpoint"]
     bucket = cfg["minio"]["bucket"]
-    result = subprocess.run(
-        ["mc", "ls", f"local/{bucket}/", "--recursive"],
-        capture_output=True, text=True
+    use_tls = cfg["minio"].get("use_tls", False)
+
+    client = Minio(
+        endpoint,
+        access_key=env.get("AWS_ACCESS_KEY_ID", ""),
+        secret_key=env.get("AWS_SECRET_ACCESS_KEY", ""),
+        secure=use_tls
     )
     repos = set()
-    if result.returncode == 0:
-        for line in result.stdout.strip().split("\n"):
-            if line.strip().endswith("/config"):
-                parts = line.strip().split()
-                path = parts[-1] if parts else ""
-                repo_prefix = path.rsplit("/config", 1)[0]
-                if repo_prefix:
-                    repos.add(repo_prefix)
+    for obj in client.list_objects(bucket, recursive=True):
+        if obj.object_name.endswith("/config"):
+            repo_prefix = obj.object_name.rsplit("/config", 1)[0]
+            if repo_prefix:
+                repos.add(repo_prefix)
     return sorted(repos)
 
 

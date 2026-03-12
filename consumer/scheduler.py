@@ -14,6 +14,7 @@ import threading
 import logging
 from datetime import datetime
 from croniter import croniter
+from minio import Minio
 import redis
 import toml
 
@@ -63,28 +64,27 @@ def prune_all_repos(cfg: dict):
     env = _restic_env()
     endpoint = cfg["minio"]["endpoint"]
     bucket = cfg["minio"]["bucket"]
+    use_tls = cfg["minio"].get("use_tls", False)
     keep_days = cfg.get("prune", {}).get("keep_days", 90)
 
-    result = subprocess.run(
-        ["mc", "ls", f"local/{bucket}/", "--recursive"],
-        capture_output=True, text=True
+    client = Minio(
+        endpoint,
+        access_key=env["AWS_ACCESS_KEY_ID"],
+        secret_key=env["AWS_SECRET_ACCESS_KEY"],
+        secure=use_tls
     )
-    if result.returncode != 0:
-        log.error("repo 목록 조회 실패: %s", result.stderr)
-        return
 
     repos = set()
-    for line in result.stdout.strip().split("\n"):
-        if line.strip().endswith("/config"):
-            parts = line.strip().split()
-            path = parts[-1] if parts else ""
-            repo_prefix = path.rsplit("/config", 1)[0]
+    for obj in client.list_objects(bucket, recursive=True):
+        if obj.object_name.endswith("/config"):
+            repo_prefix = obj.object_name.rsplit("/config", 1)[0]
             if repo_prefix:
                 repos.add(repo_prefix)
 
+    scheme = "https" if use_tls else "http"
     log.info("prune 대상 repo: %d개", len(repos))
     for repo_prefix in repos:
-        repo_url = f"s3:http://{endpoint}/{bucket}/{repo_prefix}"
+        repo_url = f"s3:{scheme}://{endpoint}/{bucket}/{repo_prefix}"
         log.info("prune: %s (keep %dd)", repo_prefix, keep_days)
         subprocess.run(
             ["restic", "forget", f"--keep-within={keep_days}d",
