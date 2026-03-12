@@ -196,15 +196,73 @@ Ring buffer dropped N events in last interval!
 │   ├── common.h               # 공용 상수, path 조립
 │   ├── vmlinux.h              # 커널 구조체 (CO-RE)
 │   └── *.h
+├── consumer/                  # 증분 백업 시스템 (Python)
+│   ├── main.py                # consumer 데몬 (Kafka → Redis)
+│   ├── consumer.py            # EventProcessor 라이브러리
+│   ├── backup.py              # restic 증분 백업 (oneshot)
+│   ├── prune.py               # 스냅샷 정리 (oneshot)
+│   ├── cli.py                 # CLI (status/snapshots/restore)
+│   ├── config.toml            # 설정
+│   ├── requirements.txt       # Python 의존성
+│   ├── README.md              # consumer 문서
+│   └── deploy/                # systemd units + install.sh
 ├── deploy/
 │   ├── file-tracker.service   # systemd unit
 │   ├── config.toml            # 배포용 기본 설정
 │   └── install.sh             # 수동 설치 스크립트
 ├── rpm/
 │   └── file-tracker.spec      # RPM spec
+├── docs/
+│   ├── PRD.md                 # 제품 요구사항
+│   └── TDD.md                 # 기술 설계
 └── test/
+    ├── e2e.sh                 # E2E 테스트 (happy path)
+    ├── e2e-edge.sh            # E2E 엣지케이스 테스트
     ├── vm-centos9/            # RHEL 9 테스트 VM
     └── vm-centos10/           # RHEL 10 테스트 VM
+```
+
+## 운영 가이드
+
+### Kafka 파티션
+
+프로덕션에서는 10+ 파티션 권장 (파티션 키=hostname, 노드별 분산):
+
+```bash
+kafka-topics.sh --create --topic file-tracker-events \
+  --partitions 10 --replication-factor 3 \
+  --bootstrap-server kafka01:9092
+```
+
+### 다중 노드 배포
+
+수백 대 노드에 동일 바이너리 + 동일 config 배포:
+
+```bash
+# RPM 배포
+sudo rpm -ivh file-tracker-1.0.0-1.el9.x86_64.rpm
+sudo vi /etc/file-tracker/config.toml   # brokers 주소만 변경
+sudo systemctl enable --now file-tracker
+```
+
+### 증분 백업 시스템
+
+별도의 `backup-consumer` 컴포넌트가 Kafka 이벤트를 소비하여 restic으로 백업:
+
+```
+file-tracker (각 노드) → Kafka → backup-consumer → restic → MinIO
+```
+
+자세한 내용은 [`consumer/README.md`](consumer/README.md) 참조.
+
+## 테스트
+
+```bash
+# E2E 테스트 (happy path) — agent→kafka→consumer→backup→restore→prune
+sudo bash test/e2e.sh      # 24개 체크포인트
+
+# E2E 엣지케이스 — Redis 장애, 동시실행, processing 복구, 대량 파일 등
+sudo bash test/e2e-edge.sh  # 19개 체크포인트
 ```
 
 ## 라이선스

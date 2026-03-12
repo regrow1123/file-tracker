@@ -22,39 +22,42 @@
               └──────────┬──────────┘
                          │
                     ┌────▼────┐
-                    │  Kafka  │
+                    │  Kafka  │  10 파티션, 파티션 키=hostname
                     └────┬────┘
                          │
 ┌────────────────────────▼─────────────────────────────────┐
-│  중앙 서버 (Lustre 마운트)                                 │
+│  소비자 (Lustre 마운트, 멀티노드 스케일 가능)              │
 │  ┌──────────────────────────────────────────────────┐    │
-│  │  backup-consumer (소비자)                          │    │
+│  │  backup-consumer                                  │    │
 │  │                                                   │    │
-│  │  Kafka consumer → Redis (경로 기준 중복 제거)       │    │
+│  │  Kafka consumer (수동 커밋, at-least-once)         │    │
+│  │   → 배치 파싱 (100건/5초)                          │    │
+│  │   → Redis pipeline flush                          │    │
+│  │   → flush 성공 후 Kafka commit                    │    │
 │  │                        │                          │    │
-│  │  백업 트리거 (cron/수동)                            │    │
+│  │  백업 (systemd timer, 매일 03:00)                  │    │
 │  │       │                                           │    │
 │  │       ▼                                           │    │
-│  │  Redis → repo별 그룹핑 → 태스크 큐                 │    │
+│  │  분산 락 → RENAME → HSCAN → repo별 그룹핑          │    │
 │  │       │                                           │    │
 │  │       ▼                                           │    │
-│  │  Worker Pool (N개)                                │    │
-│  │   각 worker: restic --files-from → MinIO          │    │
-│  │   서로 다른 repo는 동시 실행                        │    │
-│  │       │                                           │    │
-│  │  Redis 정리 + Kafka offset commit                 │    │
+│  │  ThreadPoolExecutor → restic --files-from → MinIO │    │
+│  │   실패: 3회 재시도 → pending 복원                   │    │
+│  │                                                   │    │
+│  │  Prometheus :9101/metrics                         │    │
 │  └──────────────────────────────────────────────────┘    │
 │                                                          │
-│  ┌──────────────────┐                                    │
-│  │  MinIO (S3)      │ ← 단일 버킷, prefix별 restic repo  │
-│  │  청크 dedup      │                                    │
-│  └──────────────────┘                                    │
+│  ┌──────────────────┐   ┌──────────────────┐            │
+│  │  Redis (AOF)     │   │  MinIO (S3)      │            │
+│  │  pending Hash    │   │  단일 버킷       │            │
+│  │  분산 락         │   │  prefix별 repo   │            │
+│  └──────────────────┘   └──────────────────┘            │
 └──────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-# Part A: 에이전트 (file-tracker) — 구현 완료
+# Part A: 에이전트 (file-tracker)
 
 ## 2. eBPF 프로그램
 
@@ -93,6 +96,7 @@ struct file_event {
 - `void *idmap_or_userns`: vfs_unlink/do_truncate 첫 인자 (5.14 vs 6.x)
 - `struct renamedata *`: vfs_rename (5.12+ 동일)
 - BTF 기반 오프셋 자동 패치
+- 단일 바이너리로 RHEL 9 (5.14) + RHEL 10 (6.12) 지원
 
 ## 3. 유저스페이스 데몬
 
@@ -119,7 +123,7 @@ Ring Buffer Poll (100ms)
                                 ▼
                           Kafka send
                           ├─ 성공 → 완료
-                          └─ 실패 → WAL 기록
+                          └─ 실패 → WAL 기록 → 30초 재시도
 ```
 
 ### 3.3 성능 (부하 테스트 결과)
@@ -139,7 +143,7 @@ Ring Buffer Poll (100ms)
 
 ---
 
-# Part B: 소비자 (backup-consumer) — 설계
+# Part B: 소비자 (backup-consumer)
 
 ## 4. 소비자 아키텍처
 
@@ -149,6 +153,7 @@ Ring Buffer Poll (100ms)
 - 동일 파일에 대해 여러 노드에서 이벤트 발생 가능 → **경로 기준** 중복 제거
 - 소비자가 Lustre를 직접 마운트 → SSH pull 불필요
 - 디렉토리 구조: `/home/{스토리지명}/{사용자 또는 부서}/...`
+- **멀티노드 스케일 가능**: 같은 Kafka group_id로 소비자 추가 시 파티션 자동 리밸런싱
 
 ### 4.2 repo 분리 전략
 
@@ -163,11 +168,11 @@ def get_repo_id(path, base="/home", depth=2):
 
 **예시 (depth=2):**
 
-```
-/home/stor1/userA/docs/a.txt  → repo: stor1/userA
-/home/stor1/userB/data/b.txt  → repo: stor1/userB
-/home/stor2/deptC/proj/c.txt  → repo: stor2/deptC
-```
+| 파일 경로 | repo_id |
+|-----------|---------|
+| `/home/stor1/userA/docs/a.txt` | `stor1/userA` |
+| `/home/stor1/userB/data/b.txt` | `stor1/userB` |
+| `/home/stor2/deptC/proj/c.txt` | `stor2/deptC` |
 
 **MinIO 구조:**
 
@@ -177,72 +182,117 @@ s3://file-tracker-backup/
   stor1/userA/data/...
   stor1/userA/snapshots/...
   stor1/userB/config        ← restic repo
-  stor1/userB/data/...
   stor2/deptC/config        ← restic repo
   ...
 ```
 
 단일 버킷, prefix로 repo 분리. repo 수 제한 없음.
 
-### 4.3 repo 자동 초기화
+### 4.3 서비스 구성
 
-첫 이벤트 시 해당 repo가 없으면 자동 생성:
-
-```python
-initialized_repos = set()  # 메모리 캐시
-
-def ensure_repo(repo_id):
-    if repo_id in initialized_repos:
-        return
-    repo_url = f"s3:http://minio:9000/file-tracker-backup/{repo_id}"
-    result = subprocess.run(["restic", "cat", "config", "-r", repo_url],
-                            capture_output=True)
-    if result.returncode != 0:
-        subprocess.run(["restic", "init", "-r", repo_url])
-    initialized_repos.add(repo_id)
-```
-
-### 4.4 서비스 구성
-
-3개의 독립 서비스로 분리:
+3개의 독립 서비스 + Prometheus:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
 │  backup-consumer.service (상시 실행)                      │
 │  ┌─────────────┐   ┌──────────────────────────────────┐ │
-│  │ Kafka       │──▶│ EventProcessor                    │ │
-│  │ Consumer    │   │ - mtime_change → HSET pending     │ │
-│  └─────────────┘   │ - rename → pipeline(HDEL+HSET)    │ │
-│                     │ - delete → 무시 (이전 스냅샷 보존)  │ │
+│  │ Kafka       │──▶│ EventProcessor (배치 모드)         │ │
+│  │ Consumer    │   │ - parse_event(): 파싱만, Redis 무  │ │
+│  │ (수동 커밋) │   │ - flush_batch(): pipeline 일괄     │ │
+│  └─────────────┘   │ - flush 성공 → Kafka commit       │ │
+│                     │ - flush 실패 → commit 안 함       │ │
+│                     │   → Kafka에서 재수신 (at-least-1) │ │
 │                     └──────────────────────────────────┘ │
-│                                    ↓                     │
-│                              ┌──────────┐               │
-│                              │  Redis   │               │
-│                              │ pending  │               │
-│                              └──────────┘               │
+│                              ↓                           │
+│  Prometheus :9101/metrics                                │
+│  - backup_events_processed_total                         │
+│  - backup_events_skipped_delete_total                    │
+│  - backup_events_errors_total                            │
+│  - backup_events_redis_errors_total                      │
+│  - backup_pending_total                                  │
+│  - backup_last_run_{timestamp,backed_up,errors,duration} │
+│  - backup_kafka_errors_total{type}                       │
+│  - backup_kafka_commit_errors_total                      │
 └─────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────┐
 │  backup-run.timer → backup-run.service (매일 03:00)      │
-│  1. RENAME pending → processing (원자적 swap)            │
-│  2. HSCAN processing (1만 건 배치)                       │
-│  3. repo별 그룹핑 (get_repo_id)                          │
-│  4. ThreadPoolExecutor → repo별 restic backup            │
-│  5. DELETE processing                                    │
-│                     ↓                                    │
-│  ┌──────────────────────────────────────────────────┐   │
-│  │ MinIO (S3)                                        │   │
-│  │ s3://file-tracker-backup/{repo_id}/               │   │
-│  └──────────────────────────────────────────────────┘   │
+│  1. 분산 락 획득 (SET backup:lock NX EX 7200)            │
+│  2. RENAME pending → processing (원자적 swap)            │
+│     - processing 잔존 시 → 중단된 백업 이어서 처리       │
+│  3. HSCAN processing (1만 건 배치)                       │
+│  4. repo별 그룹핑 (get_repo_id)                          │
+│  5. ThreadPoolExecutor → repo별 restic backup            │
+│     - 실패: 3회 재시도 (10s, 20s backoff)                │
+│     - 최종 실패: paths를 pending에 복원 (value="retry")   │
+│  6. DELETE processing                                    │
+│  7. 결과 → Redis backup:last_run (Prometheus용)          │
+│  8. 분산 락 해제                                         │
 └─────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────┐
 │  backup-prune.timer → backup-prune.service (매주 일 04:00)│
-│  MinIO SDK로 repo 목록 탐색 → restic forget --prune      │
+│  1. 분산 락 획득 (backup/prune 동시 실행 방지)            │
+│  2. MinIO SDK로 repo 목록 탐색                           │
+│  3. 각 repo: restic forget --keep-within=90d --prune     │
+│  4. 분산 락 해제                                         │
 └─────────────────────────────────────────────────────────┘
 ```
 
-### 4.5 변경 DB (Redis)
+### 4.4 Kafka 소비 — 수동 커밋 + 배치 파이프라인
+
+```
+Kafka poll (1s timeout)
+    │
+    ├─ 이벤트 수신 → parse_event() (파싱만, Redis 호출 없음)
+    │                 │
+    │                 └→ 배치 큐에 추가
+    │
+    ├─ 배치 크기 ≥ 100건
+    │   OR 마지막 flush 후 ≥ 5초
+    │       │
+    │       ▼
+    │   Redis pipeline flush
+    │       │
+    │       ├─ 성공 → kafka_consumer.commit() → 배치 리셋
+    │       │
+    │       └─ 실패 → commit 안 함 → redis_down 상태 진입
+    │                  → ping 재연결 루프 (Kafka poll은 유지)
+    │                  → 복구 후 Kafka에서 미커밋 이벤트 재수신
+    │
+    └─ HSET은 idempotent → 중복 처리 무해
+```
+
+**at-least-once 보장**: Redis에 쓰기 성공한 후에만 Kafka offset을 커밋. Redis 장애 시 offset이 올라가지 않으므로 복구 후 같은 이벤트를 다시 받는다.
+
+### 4.5 Kafka 장애 핸들링
+
+| 시나리오 | 처리 |
+|---------|------|
+| 시작 시 브로커 다운 | `list_topics()` 연결 확인 → 5초 간격 무한 재시도 |
+| 운영 중 브로커 다운 | librdkafka 자동 재연결 + `error_cb` 콜백 로깅/메트릭 |
+| commit 실패 | `safe_commit()` catch → 로그 + 다음 배치에서 자연 재커밋 |
+
+```python
+def error_cb(err):
+    if err.code() == KafkaError._ALL_BROKERS_DOWN:
+        log.error("Kafka: 모든 브로커 다운")
+    elif err.code() == KafkaError._TRANSPORT:
+        log.warning("Kafka: 브로커 연결 끊김 (자동 재연결)")
+```
+
+librdkafka 통계: 60초 간격 `stats_cb`로 DEBUG 레벨 로깅.
+
+### 4.6 Redis 장애 핸들링
+
+| 시나리오 | 처리 |
+|---------|------|
+| consumer 시작 시 Redis 다운 | `connect_redis()` 5초 간격 무한 재시도 |
+| consumer 운영 중 Redis 다운 | flush 실패 → commit 안 함 → ping 재연결 → Kafka 재수신 |
+| backup 시작 시 Redis 다운 | 3회 재시도 (10s, 20s 간격) → exit 1 (systemd 재스케줄) |
+| backup 중단 (kill/OOM) | processing 키 잔존 → 다음 실행에서 이어서 처리 |
+
+### 4.7 변경 DB (Redis)
 
 ```
 HSET pending "/home/stor1/userA/docs/a.txt" "mtime_change"
@@ -252,9 +302,9 @@ HSET pending "/home/stor2/deptC/proj/c.txt" "rename"
 - **단순 문자열 값**: event_type만 저장 (ts, JSON 불필요)
 - `HSET`: 같은 경로면 덮어쓰기 (자연 dedup)
 - `HLEN pending`: 대기 건수
-- `HSCAN processing`: 배치 조회 (Redis 블로킹 방지)
+- `HSCAN processing`: 배치 조회 (1만 건씩, Redis 블로킹 방지)
 
-### 4.6 이벤트 처리 규칙
+### 4.8 이벤트 처리 규칙
 
 | Kafka 이벤트 | Redis 동작 |
 |-------------|-----------|
@@ -266,73 +316,80 @@ HSET pending "/home/stor2/deptC/proj/c.txt" "rename"
 
 **delete 무시 이유**: 삭제된 파일은 이전 스냅샷에 이미 보존. 보존기간(keep_days) 후 prune에서 자동 정리.
 
-### 4.7 백업 실행 흐름 (RENAME 방식)
+### 4.9 분산 락 — 동시 실행 방지
+
+backup과 prune이 같은 Redis 락을 공유:
 
 ```python
-def run_backup():
-    # 1. 원자적 swap: consumer와 간섭 차단
-    r.rename("pending", "processing")
-    # 이후 consumer는 새 "pending"에 쓰기
-
-    # 2. HSCAN으로 배치 추출 (Redis 블로킹 방지)
-    tasks = {}
-    cursor = 0
-    while True:
-        cursor, items = r.hscan("processing", cursor, count=10000)
-        for path in items:
-            repo_id = get_repo_id(path)
-            tasks.setdefault(repo_id, []).append(path)
-        if cursor == 0:
-            break
-
-    # 3. repo별 병렬 백업
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(backup_repo, repo_id, paths): repo_id
-                   for repo_id, paths in tasks.items()}
-        for future in as_completed(futures):
-            future.result()
-
-    # 4. processing 삭제
-    r.delete("processing")
+# 획득
+r.set("backup:lock", f"{hostname}", nx=True, ex=7200)
+# 해제
+r.delete("backup:lock")
 ```
 
-**RENAME이 해결하는 문제**: HGETALL → backup → HDEL 사이에 consumer가 새 이벤트를 넣으면 HDEL이 새 이벤트까지 삭제. RENAME으로 consumer와 backup이 서로 다른 Hash를 쓰므로 간섭 없음.
+| 시나리오 | 결과 |
+|---------|------|
+| 노드A backup + 노드B backup | B 스킵 (락 충돌) |
+| backup + prune 동시 | prune 스킵 |
+| 프로세스 kill | TTL 2시간 후 자동 해제 |
+| 정상 완료 | finally에서 즉시 해제 |
 
-**로드밸런싱**: ThreadPoolExecutor의 큐 기반. 작은 repo를 먼저 끝낸 worker가 다음 repo를 가져감.
+- `NX`: 키 없을 때만 생성
+- `EX 7200`: TTL 2시간 (`TimeoutStartSec=7200`과 일치)
+- value에 `hostname(:prune)` 저장 → 어느 노드가 실행 중인지 확인 가능
 
-### 4.8 스냅샷 관리
+### 4.10 restic 백업 실행
+
+```python
+def backup_repo(repo_id, paths, cfg, env, repo_mgr):
+    repo_url = f"s3:{scheme}://{endpoint}/{bucket}/{repo_id}"
+    repo_mgr.ensure(repo_url, env)           # init if needed (thread-safe)
+    existing = [p for p in paths if os.path.exists(p)]  # 삭제된 파일 제외
+
+    with tempfile.NamedTemporaryFile(mode="w") as f:
+        f.write("\n".join(existing))
+        # 최대 3회 재시도 (10s, 20s backoff)
+        restic backup --files-from f.name -r repo_url --tag incremental
+```
+
+- **RepoManager**: `threading.Lock` + `_pending` set으로 같은 repo 중복 init 방지
+- **재시도**: 3회, 최종 실패 시 해당 repo의 paths를 `pending`에 `"retry"` 값으로 복원
+- **returncode 3**: "일부 파일 누락"은 성공 처리 (WARNING 로그)
+
+### 4.11 Prometheus 모니터링
+
+consumer(main.py)가 상시 실행하며 HTTP `:9101/metrics` 노출:
+
+| 메트릭 | 타입 | 설명 |
+|--------|------|------|
+| `backup_events_processed_total` | counter | 처리된 이벤트 |
+| `backup_events_skipped_delete_total` | counter | 무시된 delete |
+| `backup_events_errors_total` | counter | 처리 에러 |
+| `backup_events_redis_errors_total` | counter | Redis pipeline 실패 |
+| `backup_pending_total` | gauge | Redis pending 건수 |
+| `backup_last_run_timestamp` | gauge | 마지막 백업 시각 |
+| `backup_last_run_backed_up` | gauge | 마지막 백업 건수 |
+| `backup_last_run_errors` | gauge | 마지막 백업 에러 |
+| `backup_last_run_duration_seconds` | gauge | 마지막 백업 소요시간 |
+| `backup_kafka_errors_total{type}` | counter | Kafka 에러 (유형별) |
+| `backup_kafka_commit_errors_total` | counter | Kafka commit 실패 |
+
+backup 결과는 Redis `backup:last_run` Hash에 기록, consumer가 10초 간격으로 gauge에 반영.
+
+### 4.12 스냅샷 관리
 
 ```bash
 # 특정 사용자의 스냅샷 목록
 restic snapshots -r s3:http://minio:9000/file-tracker-backup/stor1/userA
 
 # 시점 복원
-restic restore <snapshot-id> \
+restic restore latest \
   --target /restore \
   --include /home/stor1/userA/docs/a.txt \
   -r s3:http://minio:9000/file-tracker-backup/stor1/userA
 
-# 오래된 스냅샷 정리 (90일 보존)
-restic forget --keep-within 90d --prune \
-  -r s3:http://minio:9000/file-tracker-backup/stor1/userA
-```
-
-경로에서 repo를 바로 특정:
-```
-"/home/stor1/userA/docs/a.txt" 복원
-→ depth=2 → repo = "stor1/userA"
-→ restic -r s3://.../stor1/userA
-```
-
-### 4.9 풀스캔 보정
-
-이벤트 유실 대비 주기적 풀스캔:
-
-```
-매주 일요일 새벽:
-  1. Lustre에서 find /home -type f -newer <last_fullscan_marker> 실행
-  2. 결과를 Redis pending에 추가
-  3. 정상 백업 흐름으로 처리
+# CLI로 복원
+python3 cli.py restore /home/stor1/userA/docs/a.txt -t /restore
 ```
 
 ## 5. 기술 선택
@@ -351,18 +408,41 @@ I/O 바운드 (Kafka read + restic 호출). CPU 집약 아님. confluent-kafka-p
 | 동시 쓰기 | 같은 repo 불가, 다른 repo 가능 |
 | 라이선스 | BSD 2-Clause (상업 무료) |
 
-repo를 depth 기반으로 분리하여 동시 쓰기 문제 해결. `--files-from`으로 변경 파일만 깔끔하게 백업.
+repo를 depth 기반으로 분리하여 동시 쓰기 문제 해결.
 
 ### 5.3 변경 DB: Redis
 
 - 단일 Hash (`pending`) 하나로 관리
-- `HSET`으로 upsert (중복 제거)
-- `HSCAN`으로 배치 조회 (1만 건씩, Redis 블로킹 방지)
+- `HSET`으로 upsert (자연 중복 제거)
+- `HSCAN`으로 배치 조회 (1만 건씩)
 - `RENAME`으로 consumer/backup 간 격리
+- 분산 락 (`backup:lock`) 으로 멀티노드 동시 실행 방지
 
 ## 6. 설정
 
-`/etc/backup-consumer/config.toml` (시크릿 미포함):
+### 6.1 에이전트 (`/etc/file-tracker/config.toml`)
+
+```toml
+[kafka]
+brokers = "kafka01:9092,kafka02:9092"
+topic = "file-tracker-events"
+
+[debounce]
+quiet_ms = 10000
+max_wait_ms = 3600000
+
+[wal]
+path = "/var/lib/file-tracker/wal.log"
+max_size_mb = 1024
+
+[watch]
+prefix = "/home"
+
+[logging]
+level = "info"
+```
+
+### 6.2 소비자 (`/etc/backup-consumer/config.toml`)
 
 ```toml
 [kafka]
@@ -386,9 +466,15 @@ redis_url = "redis://localhost:6379/0"
 
 [prune]
 keep_days = 90
+
+[logging]
+level = "INFO"
+
+[metrics]
+port = 9101
 ```
 
-`/etc/backup-consumer/env` (시크릿, chmod 600):
+### 6.3 시크릿 (`/etc/backup-consumer/env`, chmod 600)
 
 ```
 RESTIC_PASSWORD=your-password
@@ -396,21 +482,37 @@ AWS_ACCESS_KEY_ID=minioadmin
 AWS_SECRET_ACCESS_KEY=minioadmin
 ```
 
-스케줄은 systemd timer에서 관리:
-- `backup-run.timer`: `OnCalendar=*-*-* 03:00:00`
-- `backup-prune.timer`: `OnCalendar=Sun *-*-* 04:00:00`
+## 7. 테스트
 
-## 7. 구현 단계
+### 7.1 E2E 테스트 (happy path)
 
-| Phase | 내용 | 의존성 | 예상 공수 |
-|-------|------|--------|----------|
-| **B-1** | Kafka consumer + Redis 변경 DB | Kafka, Redis | 1일 |
-| **B-2** | restic + MinIO 연동: 단일 repo 증분 백업 | MinIO, restic | 1일 |
-| **B-3** | repo 분리 + 병렬: depth 기반 repo + worker pool | | 1일 |
-| **B-4** | 스케줄러: cron 백업 + 스냅샷 정리 (forget/prune) | | 반나절 |
-| **B-5** | 풀스캔 보정: 주기적 전체 비교 + 차분 백업 | | 반나절 |
-| **B-6** | CLI: 스냅샷 조회, 파일 복원, 상태 확인 | | 1일 |
-| **B-7** | 운영: systemd, 로깅, 모니터링, 문서 | | 반나절 |
+`test/e2e.sh` — 24개 체크포인트:
+
+```
+PREREQ  → 바이너리, restic, redis, minio SDK, Kafka, MinIO
+AGENT   → eBPF 시작, 파일 조작 (생성/수정/삭제/rename), Kafka 전송 확인
+CONSUMER → pending 수집, mtime/rename/delete 검증
+BACKUP  → 실행, pending 정리, last_run 기록, restic 스냅샷
+RESTORE → 실행, 파일 내용 diff 일치
+PRUNE   → 실행, 최근 스냅샷 유지 확인
+METRICS → Prometheus 메트릭 노출 확인
+```
+
+### 7.2 E2E 엣지케이스 테스트
+
+`test/e2e-edge.sh` — 9개 시나리오, 19개 체크포인트:
+
+| 시나리오 | 검증 항목 |
+|---------|----------|
+| 빈 pending backup | no-op 정상 종료 |
+| 존재하지 않는 파일 backup | skipped 처리 |
+| 분산 락 충돌 | 스킵 + pending 유지 |
+| processing 복구 | 중단 지점부터 이어서 |
+| Redis 다운 + 복구 | at-least-once 재수신 |
+| rename 체인 A→B→C | 최종 C만 pending |
+| 1만건 배치 커밋 | lag 0, 전부 처리 |
+| delete 필터링 | 100건 무시, 10건만 저장 |
+| WAL 복구 (Kafka 다운) | 복구 후 재전송 |
 
 ## 8. 알려진 제약
 
