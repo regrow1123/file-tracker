@@ -1,0 +1,15 @@
+[Unit]
+Description=backup-run: restic incremental backup
+After=network-online.target redis.service
+
+[Service]
+Type=oneshot
+User=backup
+Group=backup
+EnvironmentFile=/etc/backup-consumer/env
+ExecStart=/usr/bin/python3 /opt/backup-consumer/backup.py /etc/backup-consumer/config.toml
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=backup-run
+MemoryMax=512M
+TimeoutStartSec=7200

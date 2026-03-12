@@ -4,7 +4,6 @@ topic = "file-tracker-events"
 group_id = "backup-consumer"
 
 [backup]
-schedule = "0 3 * * *"
 restic_binary = "/usr/bin/restic"
 workers = 4
 base_path = "/home"
@@ -19,9 +18,4 @@ use_tls = false
 redis_url = "redis://localhost:6379/0"
 
 [prune]
-schedule = "0 4 * * 0"
 keep_days = 90
-
-[fullscan]
-enabled = true
-schedule = "0 2 * * 0"

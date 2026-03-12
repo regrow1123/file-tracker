@@ -1,0 +1,15 @@
+[Unit]
+Description=backup-prune: restic snapshot cleanup
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=backup
+Group=backup
+EnvironmentFile=/etc/backup-consumer/env
+ExecStart=/usr/bin/python3 /opt/backup-consumer/prune.py /etc/backup-consumer/config.toml
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=backup-prune
+MemoryMax=512M
+TimeoutStartSec=7200
