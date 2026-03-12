@@ -26,6 +26,14 @@ def main():
     config_path = sys.argv[1] if len(sys.argv) > 1 else "config.toml"
     cfg = toml.load(config_path)
 
+    level = cfg.get("logging", {}).get("level", "INFO")
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True
+    )
+
     r = redis.Redis.from_url(cfg["db"]["redis_url"], decode_responses=True)
     r.ping()
     log.info("Redis OK, pending: %d건", r.hlen("pending"))

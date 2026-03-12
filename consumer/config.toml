@@ -20,5 +20,8 @@ redis_url = "redis://localhost:6379/0"
 [prune]
 keep_days = 90
 
+[logging]
+level = "INFO"                      # DEBUG, INFO, WARNING, ERROR
+
 [metrics]
 port = 9101
