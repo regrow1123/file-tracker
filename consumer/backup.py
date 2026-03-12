@@ -9,6 +9,7 @@ import os
 import subprocess
 import tempfile
 import threading
+import time
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import redis
@@ -97,21 +98,31 @@ def backup_repo(repo_id: str, paths: list[str], cfg: dict, env: dict,
         list_file = f.name
 
     try:
-        proc = subprocess.run(
-            [restic_bin, "backup", "--files-from", list_file,
-             "-r", repo_url, "--tag", "incremental"],
-            capture_output=True, env=env, timeout=3600
-        )
-        if proc.returncode in (0, 3):  # 3 = incomplete (일부 파일 누락)
-            result["backed_up"] = len(existing)
-            if proc.returncode == 3:
-                log.warning("repo=%s 일부 파일 누락: %d건", repo_id, len(existing))
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            proc = subprocess.run(
+                [restic_bin, "backup", "--files-from", list_file,
+                 "-r", repo_url, "--tag", "incremental"],
+                capture_output=True, env=env, timeout=3600
+            )
+            if proc.returncode in (0, 3):
+                result["backed_up"] = len(existing)
+                if proc.returncode == 3:
+                    log.warning("repo=%s 일부 파일 누락: %d건",
+                                repo_id, len(existing))
+                else:
+                    log.info("repo=%s 백업 완료: %d건", repo_id, len(existing))
+                break
             else:
-                log.info("repo=%s 백업 완료: %d건", repo_id, len(existing))
-        else:
-            log.error("repo=%s 백업 실패: %s",
-                      repo_id, proc.stderr.decode()[:200])
-            result["errors"] = len(existing)
+                stderr = proc.stderr.decode()[:200]
+                if attempt < max_retries:
+                    delay = attempt * 10  # 10s, 20s
+                    log.warning("repo=%s 백업 실패 (시도 %d/%d), %ds 후 재시도: %s",
+                                repo_id, attempt, max_retries, delay, stderr)
+                    time.sleep(delay)
+                else:
+                    log.error("repo=%s 백업 최종 실패: %s", repo_id, stderr)
+                    result["errors"] = len(existing)
     finally:
         os.unlink(list_file)
 
@@ -172,6 +183,7 @@ def run_backup(cfg: dict, r: redis.Redis):
 
     # 5. Worker pool로 병렬 실행
     total = {"backed_up": 0, "skipped": 0, "errors": 0}
+    failed_repos = []
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
@@ -186,11 +198,26 @@ def run_backup(cfg: dict, r: redis.Redis):
                 total["backed_up"] += res["backed_up"]
                 total["skipped"] += res["skipped"]
                 total["errors"] += res["errors"]
+                if res["errors"] > 0:
+                    failed_repos.append(repo_id)
             except Exception as e:
                 log.error("repo=%s 예외: %s", repo_id, e)
                 total["errors"] += len(tasks[repo_id])
+                failed_repos.append(repo_id)
 
-    # 6. processing 삭제 (에러 있어도 삭제 — 재시도는 다음 이벤트에서)
+    # 6. 실패한 repo의 경로를 pending에 복원 (다음 타이머에서 재시도)
+    if failed_repos:
+        pipe = r.pipeline()
+        restored = 0
+        for repo_id in failed_repos:
+            for path in tasks[repo_id]:
+                pipe.hset("pending", path, "retry")
+                restored += 1
+        pipe.execute()
+        log.warning("실패 repo %d개, %d건 pending에 복원",
+                    len(failed_repos), restored)
+
+    # 7. processing 삭제
     r.delete("processing")
 
     log.info("백업 완료. 백업: %d, 스킵: %d, 에러: %d",
