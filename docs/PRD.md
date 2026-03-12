@@ -96,20 +96,21 @@
 
 - Kafka consumer group으로 이벤트 소비
 - Lustre 공유 마운트이므로 **경로 기준으로 중복 제거** (hostname 무관)
-- 변경 DB (Redis Hash)에 경로 키로 upsert (timestamp 비교로 순서 역전 방지):
+- 변경 DB (Redis Hash)에 경로 키로 단순 HSET (ts 비교 불필요: 백업 시 Lustre 현재 상태 직접 읽음):
   - `mtime_change` → 백업 대상
-  - `delete` → 삭제 기록
+  - `delete` → 무시 (이전 스냅샷에 보존, 보존기간 후 prune)
   - `rename` → old_path 제거 + new_path 백업
 
 ### 6.6 소비자: 증분 백업 실행
 
 - 주기적 (매일 새벽 등) 또는 수동 트리거
-- 변경 DB에서 파일 목록 추출 → repo별로 그룹핑 → 태스크 큐
-- worker pool이 빈 worker부터 태스크(repo) 할당 → 자연스러운 로드밸런싱
+- RENAME으로 pending → processing 원자적 swap (consumer와 간섭 차단)
+- HSCAN으로 배치 추출 (Redis 블로킹 방지)
+- repo별로 그룹핑 → ThreadPoolExecutor로 병렬 백업
 - 소비자가 Lustre를 직접 마운트 → SSH pull 불필요
 - 각 worker가 restic `--files-from`으로 해당 repo의 변경 파일 백업
 - 서로 다른 repo는 동시 백업 가능 (restic 락은 repo 단위)
-- 백업 완료 시 변경 DB 해당 항목 제거 + Kafka offset commit
+- 백업 완료 시 processing 삭제
 
 ### 6.7 소비자: 스냅샷 복원
 

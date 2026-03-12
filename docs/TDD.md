@@ -202,143 +202,103 @@ def ensure_repo(repo_id):
     initialized_repos.add(repo_id)
 ```
 
-### 4.4 컴포넌트
+### 4.4 서비스 구성
+
+3개의 독립 서비스로 분리:
 
 ```
-┌──────────────────────────────────────────────────────┐
-│  backup-consumer                                      │
-│                                                       │
-│  ┌─────────────┐   ┌──────────────────────────────┐  │
-│  │ Kafka       │──▶│ Event Processor               │  │
-│  │ Consumer    │   │ - 이벤트 파싱                   │  │
-│  └─────────────┘   │ - 경로 기준 Redis HSET         │  │
-│                     │ - hostname 무시 (Lustre 공유)   │  │
-│                     └──────────────────────────────┘  │
-│                                                       │
-│  ┌──────────────────────────────────────────────────┐ │
-│  │ Backup Scheduler                                  │ │
-│  │ 1. HGETALL pending → 전체 변경 파일 목록           │ │
-│  │ 2. repo별 그룹핑 (get_repo_id)                    │ │
-│  │ 3. repo별 태스크 → ThreadPoolExecutor              │ │
-│  │ 4. 빈 worker가 다음 repo 태스크를 가져감           │ │
-│  │ 5. 완료 시 HDEL + Kafka offset commit             │ │
-│  └──────────────────────────────────────────────────┘ │
-│                                                       │
-│  ┌────────────────┐  ┌──────────┐                    │
-│  │ Worker Pool    │  │  Redis   │                    │
-│  │ (N개 스레드)   │  │ pending  │                    │
-│  └───────┬────────┘  └──────────┘                    │
-│          │                                            │
-│          ▼                                            │
-│  ┌──────────────────────────────────────────┐        │
-│  │ MinIO (S3)                                │        │
-│  │ s3://file-tracker-backup/{repo_id}/       │        │
-│  │ - repo별 독립 restic 리포지토리             │        │
-│  └──────────────────────────────────────────┘        │
-└──────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│  backup-consumer.service (상시 실행)                      │
+│  ┌─────────────┐   ┌──────────────────────────────────┐ │
+│  │ Kafka       │──▶│ EventProcessor                    │ │
+│  │ Consumer    │   │ - mtime_change → HSET pending     │ │
+│  └─────────────┘   │ - rename → pipeline(HDEL+HSET)    │ │
+│                     │ - delete → 무시 (이전 스냅샷 보존)  │ │
+│                     └──────────────────────────────────┘ │
+│                                    ↓                     │
+│                              ┌──────────┐               │
+│                              │  Redis   │               │
+│                              │ pending  │               │
+│                              └──────────┘               │
+└─────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────┐
+│  backup-run.timer → backup-run.service (매일 03:00)      │
+│  1. RENAME pending → processing (원자적 swap)            │
+│  2. HSCAN processing (1만 건 배치)                       │
+│  3. repo별 그룹핑 (get_repo_id)                          │
+│  4. ThreadPoolExecutor → repo별 restic backup            │
+│  5. DELETE processing                                    │
+│                     ↓                                    │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │ MinIO (S3)                                        │   │
+│  │ s3://file-tracker-backup/{repo_id}/               │   │
+│  └──────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────┐
+│  backup-prune.timer → backup-prune.service (매주 일 04:00)│
+│  MinIO SDK로 repo 목록 탐색 → restic forget --prune      │
+└─────────────────────────────────────────────────────────┘
 ```
 
 ### 4.5 변경 DB (Redis)
 
 ```
-HSET pending "/home/stor1/userA/docs/a.txt" '{"event":"mtime_change","ts":1710000000}'
-HSET pending "/home/stor1/userA/data/b.txt" '{"event":"delete","ts":1710000100}'
-HSET pending "/home/stor2/deptC/proj/c.txt" '{"event":"rename","old_path":"...","ts":1710000200}'
+HSET pending "/home/stor1/userA/docs/a.txt" "mtime_change"
+HSET pending "/home/stor2/deptC/proj/c.txt" "rename"
 ```
 
-- `HSET`: 같은 경로면 덮어쓰기 (upsert, 중복 제거)
+- **단순 문자열 값**: event_type만 저장 (ts, JSON 불필요)
+- `HSET`: 같은 경로면 덮어쓰기 (자연 dedup)
 - `HLEN pending`: 대기 건수
-- `HGETALL pending`: 전체 조회 → repo별 그룹핑
-- `HDEL pending <path>`: 백업 완료 후 제거
+- `HSCAN processing`: 배치 조회 (Redis 블로킹 방지)
 
 ### 4.6 이벤트 처리 규칙
 
 | Kafka 이벤트 | Redis 동작 |
 |-------------|-----------|
-| `mtime_change` path=A | ts 비교 후 `HSET pending A '{"event":"mtime_change","ts":...}'` |
-| `delete` path=A | ts 비교 후 `HSET pending A '{"event":"delete","ts":...}'` |
-| `rename` old=A new=B | `HDEL pending A` + `HSET pending B '{"event":"rename","old_path":"A","ts":...}'` |
+| `mtime_change` path=A | `HSET pending A "mtime_change"` |
+| `delete` path=A | 무시 (이전 스냅샷에 보존) |
+| `rename` old=A new=B | pipeline: `HDEL pending A` + `HSET pending B "rename"` |
 
-**timestamp 비교**: 이벤트 순서 역전 방지. Lustre 공유 환경에서 여러 노드의 이벤트가 다른 Kafka 파티션을 거쳐 순서가 뒤바뀔 수 있다. 기존 ts보다 오래된 이벤트는 무시:
+**ts 비교 불필요**: pending은 "이 파일을 확인하라"는 마커. 백업 시 Lustre에서 현재 파일을 직접 읽으므로 이벤트 순서가 결과에 영향 없음.
 
-```python
-def upsert_event(path, event, ts):
-    existing = redis.hget("pending", path)
-    if existing:
-        old_ts = json.loads(existing)["ts"]
-        if ts <= old_ts:
-            return  # 오래된 이벤트 → 무시
-    redis.hset("pending", path, json.dumps({"event": event, "ts": ts}))
-```
+**delete 무시 이유**: 삭제된 파일은 이전 스냅샷에 이미 보존. 보존기간(keep_days) 후 prune에서 자동 정리.
 
-### 4.7 백업 실행 흐름
+### 4.7 백업 실행 흐름 (RENAME 방식)
 
 ```python
 def run_backup():
-    # 1. Redis에서 전체 변경 파일 추출
-    all_items = redis.hgetall("pending")
+    # 1. 원자적 swap: consumer와 간섭 차단
+    r.rename("pending", "processing")
+    # 이후 consumer는 새 "pending"에 쓰기
 
-    # 2. repo별 그룹핑
-    tasks = {}  # {repo_id: {path: info, ...}}
-    for path, info in all_items.items():
-        repo_id = get_repo_id(path)
-        tasks.setdefault(repo_id, {})[path] = info
+    # 2. HSCAN으로 배치 추출 (Redis 블로킹 방지)
+    tasks = {}
+    cursor = 0
+    while True:
+        cursor, items = r.hscan("processing", cursor, count=10000)
+        for path in items:
+            repo_id = get_repo_id(path)
+            tasks.setdefault(repo_id, []).append(path)
+        if cursor == 0:
+            break
 
-    # 3. Worker pool이 repo 태스크를 처리 (로드밸런싱)
-    with ThreadPoolExecutor(max_workers=10) as pool:
-        futures = {
-            pool.submit(backup_repo, repo_id, files): repo_id
-            for repo_id, files in tasks.items()
-        }
+    # 3. repo별 병렬 백업
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(backup_repo, repo_id, paths): repo_id
+                   for repo_id, paths in tasks.items()}
         for future in as_completed(futures):
-            future.result()  # 에러 처리
+            future.result()
 
-    # 4. Kafka offset commit
-    consumer.commit()
-
-def backup_repo(repo_id, files):
-    ensure_repo(repo_id)
-    repo_url = f"s3:http://minio:9000/file-tracker-backup/{repo_id}"
-
-    # mtime_change + rename만 백업 (delete는 파일이 없으므로 제외)
-    backup_list = [p for p, info in files.items()
-                   if json.loads(info)["event"] != "delete"]
-
-    if backup_list:
-        # 파일 목록을 임시 파일에 작성
-        list_file = f"/tmp/restic-{repo_id.replace('/', '-')}.txt"
-        with open(list_file, "w") as f:
-            f.write("\n".join(backup_list))
-
-        subprocess.run([
-            "restic", "backup",
-            "--files-from", list_file,
-            "-r", repo_url,
-            "--tag", "incremental"
-        ], check=True)
-        os.unlink(list_file)
-
-    # Redis에서 처리된 항목 제거
-    for path in files:
-        redis.hdel("pending", path)
+    # 4. processing 삭제
+    r.delete("processing")
 ```
 
-**로드밸런싱 동작:**
+**RENAME이 해결하는 문제**: HGETALL → backup → HDEL 사이에 consumer가 새 이벤트를 넣으면 HDEL이 새 이벤트까지 삭제. RENAME으로 consumer와 backup이 서로 다른 Hash를 쓰므로 간섭 없음.
 
-```
-tasks: {
-    "stor1/userA": 10건,
-    "stor1/userB": 5건,
-    "stor2/bigDept": 3000건,
-    "stor2/userC": 2건,
-}
-
-Worker 0 → stor1/userA (10건) → 완료 → stor2/userC (2건) → 완료 → 대기
-Worker 1 → stor1/userB (5건) → 완료 → 대기
-Worker 2 → stor2/bigDept (3000건) → ... 처리 중 ...
-```
-
-작은 repo를 먼저 끝낸 worker가 놀지 않고 다음 태스크를 가져감.
+**로드밸런싱**: ThreadPoolExecutor의 큐 기반. 작은 repo를 먼저 끝낸 worker가 다음 repo를 가져감.
 
 ### 4.8 스냅샷 관리
 
@@ -397,39 +357,48 @@ repo를 depth 기반으로 분리하여 동시 쓰기 문제 해결. `--files-fr
 
 - 단일 Hash (`pending`) 하나로 관리
 - `HSET`으로 upsert (중복 제거)
-- `HGETALL`로 전체 조회 → repo별 그룹핑
+- `HSCAN`으로 배치 조회 (1만 건씩, Redis 블로킹 방지)
+- `RENAME`으로 consumer/backup 간 격리
 
 ## 6. 설정
 
-```toml
-# /etc/backup-consumer/config.toml
+`/etc/backup-consumer/config.toml` (시크릿 미포함):
 
+```toml
 [kafka]
 brokers = "kafka01:9092,kafka02:9092"
 topic = "file-tracker-events"
 group_id = "backup-consumer"
 
 [backup]
-schedule = "0 3 * * *"              # 매일 새벽 3시
 restic_binary = "/usr/bin/restic"
-workers = 10                        # 병렬 worker 수
-base_path = "/home"                 # Lustre 마운트 포인트
-repo_depth = 2                      # repo 분리 depth
+workers = 10
+base_path = "/home"
+repo_depth = 2
 
 [minio]
 endpoint = "minio:9000"
 bucket = "file-tracker-backup"
-access_key = "minioadmin"
-secret_key = "minioadmin"
 use_tls = false
 
 [db]
 redis_url = "redis://localhost:6379/0"
 
-[fullscan]
-enabled = true
-schedule = "0 2 * * 0"              # 매주 일요일 새벽 2시
+[prune]
+keep_days = 90
 ```
+
+`/etc/backup-consumer/env` (시크릿, chmod 600):
+
+```
+RESTIC_PASSWORD=your-password
+AWS_ACCESS_KEY_ID=minioadmin
+AWS_SECRET_ACCESS_KEY=minioadmin
+```
+
+스케줄은 systemd timer에서 관리:
+- `backup-run.timer`: `OnCalendar=*-*-* 03:00:00`
+- `backup-prune.timer`: `OnCalendar=Sun *-*-* 04:00:00`
 
 ## 7. 구현 단계
 
