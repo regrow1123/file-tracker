@@ -1,5 +1,5 @@
 [Unit]
-Description=backup-consumer: Kafka event consumer + restic incremental backup
+Description=backup-consumer: Kafka event consumer → Redis
 After=network-online.target redis.service
 Wants=network-online.target
 
@@ -13,7 +13,6 @@ RestartSec=10
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=backup-consumer
-MemoryMax=512M
 
 [Install]
 WantedBy=multi-user.target

@@ -149,11 +149,14 @@ def run_backup(cfg: dict, r: redis.Redis):
 
     log.info("repo %d개로 분배", len(tasks))
 
-    # 4. restic 환경변수
+    # 4. restic 환경변수 (시크릿은 환경변수에서, 없으면 config fallback)
     env = os.environ.copy()
-    env["RESTIC_PASSWORD"] = cfg["backup"]["restic_password"]
-    env["AWS_ACCESS_KEY_ID"] = cfg["minio"]["access_key"]
-    env["AWS_SECRET_ACCESS_KEY"] = cfg["minio"]["secret_key"]
+    if "RESTIC_PASSWORD" not in env:
+        env["RESTIC_PASSWORD"] = cfg["backup"].get("restic_password", "")
+    if "AWS_ACCESS_KEY_ID" not in env:
+        env["AWS_ACCESS_KEY_ID"] = cfg["minio"].get("access_key", "")
+    if "AWS_SECRET_ACCESS_KEY" not in env:
+        env["AWS_SECRET_ACCESS_KEY"] = cfg["minio"].get("secret_key", "")
 
     repo_mgr = RepoManager()
     workers = cfg["backup"].get("workers", 4)

@@ -1,0 +1,20 @@
+[Unit]
+Description=backup-scheduler: restic incremental backup + snapshot prune
+After=network-online.target redis.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=backup
+Group=backup
+EnvironmentFile=/etc/backup-consumer/env
+ExecStart=/usr/bin/python3 /opt/backup-consumer/scheduler.py /etc/backup-consumer/config.toml
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=backup-scheduler
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target
