@@ -145,12 +145,16 @@ def run_backup(cfg: dict, r: redis.Redis):
 
     start_time = time.time()
 
-    # 1. 원자적 swap: pending → processing
-    try:
-        r.rename("pending", "processing")
-    except redis.exceptions.ResponseError:
-        log.info("백업 대상 없음 (pending 비어있음)")
-        return
+    # 0. 이전 실행이 중단되어 processing이 남아있으면 이어서 처리
+    if r.exists("processing"):
+        log.warning("이전 processing 키 발견 — 중단된 백업 이어서 처리")
+    else:
+        # 1. 원자적 swap: pending → processing
+        try:
+            r.rename("pending", "processing")
+        except redis.exceptions.ResponseError:
+            log.info("백업 대상 없음 (pending 비어있음)")
+            return
 
     # 이 시점부터 consumer는 새 pending에 쓰기 (HSET이 자동 생성)
 
@@ -261,10 +265,26 @@ def main():
         force=True
     )
 
-    r = redis.Redis.from_url(cfg["db"]["redis_url"], decode_responses=True)
-    r.ping()
-    log.info("Redis 연결 OK, pending: %d건", r.hlen("pending"))
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = redis.Redis.from_url(cfg["db"]["redis_url"],
+                                     decode_responses=True,
+                                     socket_connect_timeout=5,
+                                     socket_timeout=10)
+            r.ping()
+            break
+        except (redis.exceptions.ConnectionError,
+                redis.exceptions.TimeoutError) as e:
+            if attempt == max_retries:
+                log.error("Redis 연결 실패 (%d회 시도): %s", max_retries, e)
+                sys.exit(1)
+            delay = attempt * 10
+            log.warning("Redis 연결 실패 (시도 %d/%d), %ds 후 재시도: %s",
+                        attempt, max_retries, delay, e)
+            time.sleep(delay)
 
+    log.info("Redis 연결 OK, pending: %d건", r.hlen("pending"))
     run_backup(cfg, r)
 
 
