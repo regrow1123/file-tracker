@@ -2,10 +2,12 @@
 """모든 restic repo에서 오래된 스냅샷 정리."""
 
 import os
+import socket
 import subprocess
 import sys
 import logging
 from minio import Minio
+import redis
 import toml
 
 logging.basicConfig(
@@ -73,8 +75,20 @@ def main():
         force=True
     )
 
-    prune_all_repos(cfg)
-    log.info("prune 완료")
+    # Redis 분산 락 (backup과 동시 실행 방지)
+    r = redis.Redis.from_url(cfg["db"]["redis_url"], decode_responses=True)
+    lock_key = "backup:lock"
+    node_id = socket.gethostname()
+    if not r.set(lock_key, f"{node_id}:prune", nx=True, ex=7200):
+        owner = r.get(lock_key)
+        log.warning("다른 프로세스 실행 중: %s", owner)
+        sys.exit(0)
+
+    try:
+        prune_all_repos(cfg)
+        log.info("prune 완료")
+    finally:
+        r.delete(lock_key)
 
 
 if __name__ == "__main__":

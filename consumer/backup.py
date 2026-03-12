@@ -140,10 +140,46 @@ def backup_repo(repo_id: str, paths: list[str], cfg: dict, env: dict,
     return result
 
 
+LOCK_KEY = "backup:lock"
+LOCK_TTL = 7200  # 2시간 (backup-run.service TimeoutStartSec과 일치)
+
+
+def acquire_lock(r: redis.Redis) -> bool:
+    """Redis 분산 락 획득. 멀티노드 동시 실행 방지."""
+    import socket
+    node_id = socket.gethostname()
+    acquired = r.set(LOCK_KEY, node_id, nx=True, ex=LOCK_TTL)
+    if not acquired:
+        owner = r.get(LOCK_KEY)
+        log.warning("다른 노드에서 백업 실행 중: %s", owner)
+        return False
+    log.info("백업 락 획득: %s (TTL=%ds)", node_id, LOCK_TTL)
+    return True
+
+
+def release_lock(r: redis.Redis):
+    """백업 완료 후 락 해제."""
+    r.delete(LOCK_KEY)
+    log.debug("백업 락 해제")
+
+
 def run_backup(cfg: dict, r: redis.Redis):
     """전체 백업: RENAME으로 pending 스냅샷 → repo별 병렬 restic backup."""
 
+    # 분산 락 획득
+    if not acquire_lock(r):
+        return
+
     start_time = time.time()
+
+    try:
+        _run_backup_inner(cfg, r, start_time)
+    finally:
+        release_lock(r)
+
+
+def _run_backup_inner(cfg: dict, r: redis.Redis, start_time: float):
+    """실제 백업 로직. run_backup()에서 락 보호 하에 호출."""
 
     # 0. 이전 실행이 중단되어 processing이 남아있으면 이어서 처리
     if r.exists("processing"):
