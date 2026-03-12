@@ -36,9 +36,10 @@ def get_repo_id(path: str, base: str, depth: int) -> str | None:
 class RepoManager:
     """restic repo 초기화 관리. thread-safe."""
 
-    def __init__(self):
+    def __init__(self, restic_bin: str = "restic"):
         self._initialized = set()
         self._lock = threading.Lock()
+        self._restic = restic_bin
 
     def ensure(self, repo_url: str, env: dict) -> bool:
         with self._lock:
@@ -47,13 +48,13 @@ class RepoManager:
 
         # lock 밖에서 restic 호출 (I/O 블로킹)
         result = subprocess.run(
-            ["restic", "cat", "config", "-r", repo_url],
+            [self._restic, "cat", "config", "-r", repo_url],
             capture_output=True, env=env
         )
         if result.returncode != 0:
             log.info("repo 초기화: %s", repo_url)
             result = subprocess.run(
-                ["restic", "init", "-r", repo_url],
+                [self._restic, "init", "-r", repo_url],
                 capture_output=True, env=env
             )
             if result.returncode != 0:
@@ -67,11 +68,13 @@ class RepoManager:
 
 
 def backup_repo(repo_id: str, paths: list[str], cfg: dict, env: dict,
-                repo_mgr: RepoManager) -> dict:
+                repo_mgr: RepoManager, restic_bin: str = "restic") -> dict:
     """단일 repo에 대해 restic backup 실행."""
     endpoint = cfg["minio"]["endpoint"]
     bucket = cfg["minio"]["bucket"]
-    repo_url = f"s3:http://{endpoint}/{bucket}/{repo_id}"
+    use_tls = cfg["minio"].get("use_tls", False)
+    scheme = "https" if use_tls else "http"
+    repo_url = f"s3:{scheme}://{endpoint}/{bucket}/{repo_id}"
 
     result = {"repo_id": repo_id, "total": len(paths),
               "backed_up": 0, "skipped": 0, "errors": 0}
@@ -95,7 +98,7 @@ def backup_repo(repo_id: str, paths: list[str], cfg: dict, env: dict,
 
     try:
         proc = subprocess.run(
-            ["restic", "backup", "--files-from", list_file,
+            [restic_bin, "backup", "--files-from", list_file,
              "-r", repo_url, "--tag", "incremental"],
             capture_output=True, env=env, timeout=3600
         )
@@ -158,7 +161,8 @@ def run_backup(cfg: dict, r: redis.Redis):
     if "AWS_SECRET_ACCESS_KEY" not in env:
         env["AWS_SECRET_ACCESS_KEY"] = cfg["minio"].get("secret_key", "")
 
-    repo_mgr = RepoManager()
+    restic_bin = cfg["backup"].get("restic_binary", "restic")
+    repo_mgr = RepoManager(restic_bin)
     workers = cfg["backup"].get("workers", 4)
 
     # 5. Worker pool로 병렬 실행
@@ -166,7 +170,8 @@ def run_backup(cfg: dict, r: redis.Redis):
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(backup_repo, repo_id, paths, cfg, env, repo_mgr): repo_id
+            pool.submit(backup_repo, repo_id, paths, cfg, env,
+                        repo_mgr, restic_bin): repo_id
             for repo_id, paths in tasks.items()
         }
         for future in as_completed(futures):

@@ -81,13 +81,14 @@ def prune_all_repos(cfg: dict):
             if repo_prefix:
                 repos.add(repo_prefix)
 
+    restic_bin = cfg["backup"].get("restic_binary", "restic")
     scheme = "https" if use_tls else "http"
     log.info("prune 대상 repo: %d개", len(repos))
     for repo_prefix in repos:
         repo_url = f"s3:{scheme}://{endpoint}/{bucket}/{repo_prefix}"
         log.info("prune: %s (keep %dd)", repo_prefix, keep_days)
         subprocess.run(
-            ["restic", "forget", f"--keep-within={keep_days}d",
+            [restic_bin, "forget", f"--keep-within={keep_days}d",
              "--prune", "-r", repo_url],
             capture_output=True, env=env
         )

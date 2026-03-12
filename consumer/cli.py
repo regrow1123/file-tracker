@@ -27,6 +27,10 @@ def restic_env(cfg):
     return env
 
 
+def restic_bin(cfg):
+    return cfg["backup"].get("restic_binary", "restic")
+
+
 def repo_url(cfg, repo_id):
     endpoint = cfg["minio"]["endpoint"]
     bucket = cfg["minio"]["bucket"]
@@ -91,7 +95,7 @@ def cmd_status(args):
         if args.verbose:
             url = repo_url(cfg, repo_id)
             result = subprocess.run(
-                ["restic", "snapshots", "--latest=1", "--compact",
+                [restic_bin(cfg), "snapshots", "--latest=1", "--compact",
                  "-r", url, "--json"],
                 capture_output=True, text=True, env=env
             )
@@ -125,7 +129,7 @@ def cmd_snapshots(args):
         sys.exit(1)
 
     url = repo_url(cfg, rid)
-    cmd = ["restic", "snapshots", "-r", url]
+    cmd = [restic_bin(cfg), "snapshots", "-r", url]
     if args.json_output:
         cmd.append("--json")
     subprocess.run(cmd, env=env)
@@ -147,7 +151,7 @@ def cmd_restore(args):
     url = repo_url(cfg, rid)
     target = args.target or "/tmp/restore"
 
-    cmd = ["restic", "restore", args.snapshot or "latest",
+    cmd = [restic_bin(cfg), "restore", args.snapshot or "latest",
            "--target", target,
            "--include", args.path,
            "-r", url]
