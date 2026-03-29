@@ -9,6 +9,11 @@
 #define EVENT_RENAME_FROM 2
 #define EVENT_RENAME_TO   3
 
+// BPF per-CPU counter indices
+#define CTR_DROPS  0
+#define CTR_TOTAL  1
+#define CTR_DEDUP  2
+
 struct file_event {
     uint64_t ts_ns;
     uint32_t event_type;

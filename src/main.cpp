@@ -33,24 +33,53 @@ static std::string get_hostname() {
     return "unknown";
 }
 
-// Escape string for JSON (handles control characters)
+// Escape string for JSON (handles control characters and invalid UTF-8)
 static void json_escape(std::string& out, const std::string& s) {
-    for (unsigned char c : s) {
+    size_t i = 0;
+    size_t len = s.size();
+    while (i < len) {
+        unsigned char c = s[i];
         switch (c) {
-            case '"':  out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\b': out += "\\b";  break;
-            case '\f': out += "\\f";  break;
-            case '\n': out += "\\n";  break;
-            case '\r': out += "\\r";  break;
-            case '\t': out += "\\t";  break;
+            case '"':  out += "\\\""; i++; break;
+            case '\\': out += "\\\\"; i++; break;
+            case '\b': out += "\\b";  i++; break;
+            case '\f': out += "\\f";  i++; break;
+            case '\n': out += "\\n";  i++; break;
+            case '\r': out += "\\r";  i++; break;
+            case '\t': out += "\\t";  i++; break;
             default:
                 if (c < 0x20) {
                     char buf[8];
                     snprintf(buf, sizeof(buf), "\\u%04x", c);
                     out += buf;
-                } else {
+                    i++;
+                } else if (c < 0x80) {
                     out += static_cast<char>(c);
+                    i++;
+                } else {
+                    // Validate UTF-8 sequence
+                    size_t seq_len = 0;
+                    if ((c & 0xE0) == 0xC0) seq_len = 2;
+                    else if ((c & 0xF0) == 0xE0) seq_len = 3;
+                    else if ((c & 0xF8) == 0xF0) seq_len = 4;
+
+                    bool valid = seq_len >= 2 && (i + seq_len <= len);
+                    if (valid) {
+                        for (size_t j = 1; j < seq_len; j++) {
+                            if ((static_cast<unsigned char>(s[i + j]) & 0xC0) != 0x80) {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (valid) {
+                        out.append(s, i, seq_len);
+                        i += seq_len;
+                    } else {
+                        out += "\\ufffd";  // replacement character
+                        i++;
+                    }
                 }
         }
     }
@@ -227,6 +256,11 @@ int main(int argc, char **argv) {
         Log::debug("[rename] %s -> %s", old_path.c_str(), new_path.c_str());
     };
 
+    if (!kafka.is_connected()) {
+        Log::error("Kafka producer not connected, aborting");
+        return 1;
+    }
+
     // Open, load, attach BPF
     struct probe_bpf *skel = probe_bpf__open_and_load();
     if (!skel) {
@@ -298,9 +332,9 @@ int main(int argc, char **argv) {
         // Periodic stats (every 60s)
         if (now - last_stats >= stats_interval) {
             last_stats = now;
-            uint64_t total_events = read_percpu_counter(counters_fd, 1);
-            uint64_t total_drops = read_percpu_counter(counters_fd, 0);
-            uint64_t total_dedup = read_percpu_counter(counters_fd, 2);
+            uint64_t total_events = read_percpu_counter(counters_fd, CTR_TOTAL);
+            uint64_t total_drops = read_percpu_counter(counters_fd, CTR_DROPS);
+            uint64_t total_dedup = read_percpu_counter(counters_fd, CTR_DEDUP);
             uint64_t new_drops = total_drops - prev_drops;
             prev_drops = total_drops;
 
@@ -349,9 +383,9 @@ int main(int argc, char **argv) {
 
     // Final stats
     {
-        uint64_t total_events = read_percpu_counter(counters_fd, 1);
-        uint64_t total_drops = read_percpu_counter(counters_fd, 0);
-        uint64_t total_dedup = read_percpu_counter(counters_fd, 2);
+        uint64_t total_events = read_percpu_counter(counters_fd, CTR_TOTAL);
+        uint64_t total_drops = read_percpu_counter(counters_fd, CTR_DROPS);
+        uint64_t total_dedup = read_percpu_counter(counters_fd, CTR_DEDUP);
         Log::info("Final stats: bpf_events=%llu bpf_drops=%llu bpf_dedup=%llu "
                   "kafka_sent=%llu kafka_failed=%llu wal_replayed=%llu wal_size=%llu",
                   (unsigned long long)total_events,

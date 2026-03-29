@@ -11,6 +11,11 @@
 #define EVENT_RENAME_FROM 2
 #define EVENT_RENAME_TO   3
 
+// BPF per-CPU counter indices
+#define CTR_DROPS  0
+#define CTR_TOTAL  1
+#define CTR_DEDUP  2
+
 // Dedup interval for mtime events: 1 second in nanoseconds
 #define DEDUP_INTERVAL_NS 1000000000ULL
 
@@ -80,14 +85,14 @@ static __always_inline int emit_event(struct dentry *dentry, __u32 event_type)
     if (evt->depth == 0) return 0;
 
     // Count total events
-    __u32 idx_total = 1;
+    __u32 idx_total = CTR_TOTAL;
     __u64 *total = bpf_map_lookup_elem(&counters, &idx_total);
     if (total) __sync_fetch_and_add(total, 1);
 
     // /home filtering is done in userspace
     long err = bpf_ringbuf_output(&events, evt, sizeof(*evt), 0);
     if (err < 0) {
-        __u32 idx_drop = 0;
+        __u32 idx_drop = CTR_DROPS;
         __u64 *drops = bpf_map_lookup_elem(&counters, &idx_drop);
         if (drops) __sync_fetch_and_add(drops, 1);
     }
@@ -110,7 +115,7 @@ static __always_inline int dedup_check(struct dentry *dentry)
 
     if (last && (now - *last) < DEDUP_INTERVAL_NS) {
         // Recently emitted — skip and count
-        __u32 idx_dedup = 2;
+        __u32 idx_dedup = CTR_DEDUP;
         __u64 *cnt = bpf_map_lookup_elem(&counters, &idx_dedup);
         if (cnt) __sync_fetch_and_add(cnt, 1);
         return 1;  // skip
