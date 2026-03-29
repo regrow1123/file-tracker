@@ -38,10 +38,7 @@ void Debouncer::on_event(const std::string& path, uint32_t event_type) {
 
     if (fire_max_wait) {
         cb_(path, event_type);
-        // Re-insert with fresh first_seen
-        std::lock_guard<std::mutex> lock(mu_);
-        auto now = Clock::now();
-        entries_[path] = {now, now};
+        // Don't re-insert: next event will create a fresh entry
     }
 }
 

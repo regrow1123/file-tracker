@@ -84,9 +84,9 @@ std::vector<std::string> WAL::read_all() {
 
         uint32_t actual_crc = crc32(data.data(), data.size());
         if (actual_crc != checksum) {
-            fprintf(stderr, "WAL: CRC mismatch (expected %08x, got %08x), skipping\n",
+            fprintf(stderr, "WAL: CRC mismatch (expected %08x, got %08x), stopping read\n",
                     checksum, actual_crc);
-            continue;  // skip corrupt record, try next
+            break;  // corrupt record means remaining data is unreliable
         }
 
         records.push_back(std::move(data));
@@ -101,8 +101,12 @@ void WAL::truncate() {
     if (fp_) {
         fclose(fp_);
     }
-    // Reopen in write mode (truncates)
-    fp_ = fopen(path_.c_str(), "wb+");
+    // Truncate file, then reopen in append mode for subsequent writes
+    fp_ = fopen(path_.c_str(), "wb");
+    if (fp_) {
+        fclose(fp_);
+        fp_ = fopen(path_.c_str(), "ab+");
+    }
     if (!fp_) {
         fprintf(stderr, "WAL: truncate failed: %s\n", strerror(errno));
     }

@@ -139,7 +139,10 @@ int main(int argc, char **argv) {
     Config cfg;
     std::string config_path = "/etc/file-tracker/config.toml";
     if (argc > 1) config_path = argv[1];
-    cfg.load(config_path);
+    if (!cfg.load(config_path)) {
+        fprintf(stderr, "Failed to load config: %s\n", config_path.c_str());
+        return 1;
+    }
 
     // Init logging
     Log::set_level_from_string(cfg.log_level.c_str());

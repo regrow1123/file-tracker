@@ -62,15 +62,18 @@ bool KafkaProducer::send(const std::string& json, const std::string& key) {
         return false;
     }
 
+    auto *json_copy = new std::string(json);
+
     int err = rd_kafka_produce(
         rkt_, RD_KAFKA_PARTITION_UA, RD_KAFKA_MSG_F_COPY,
         const_cast<char*>(json.data()), json.size(),
         key.data(), key.size(),
-        new std::string(json)
+        json_copy
     );
 
     if (err == -1) {
         Log::error("kafka produce queue failed: %s", rd_kafka_err2str(rd_kafka_last_error()));
+        delete json_copy;
         on_fail_(json);
         return false;
     }
